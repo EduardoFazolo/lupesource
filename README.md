@@ -20,32 +20,84 @@ Override the location only when needed:
 LUPE_HOME=/path/to/lupe-data lupe status
 ```
 
-## MVP Commands
+## Primitives
 
-Use the CLI directly from a workspace:
+### checkpoint
+
+A checkpoint is the meaningful unit of work. It holds the full user prompt, the
+agent's response, and at least one save (the initial workspace snapshot taken
+when the checkpoint was created).
 
 ```bash
-lupe status
-lupe prompt "full user prompt"
-lupe save "working change"
-lupe history
-lupe prompts
-lupe saves
-lupe graph
-lupe search "working"
-lupe diff
-lupe diff <save-a-uuid> <save-b-uuid>
-lupe restore <save-uuid>
-lupe install-agent
+lupe prompt "full user prompt"          # create checkpoint + initial save
+lupe prompt "full user prompt" --title "short override"
 ```
 
-Data model:
+### save
 
-- `prompt`: records a full user prompt and creates the meaningful checkpoint/task node.
-- `checkpoint`: lower-level command for creating a prompt-backed checkpoint manually.
-- `save`: lightweight source-state snapshot inside a checkpoint.
-- `object`: content-addressed file bytes stored outside SQLite.
-- `graph`: colored terminal view of prompt/checkpoint nodes and nested saves.
+A save is a cheap snapshot of the workspace inside the current checkpoint.
+Create them freely — before risky edits, after tests pass, before trying a
+different approach. They do not pollute any external history.
+
+```bash
+lupe save "what now works or changed"
+```
+
+### restore
+
+Restore rolls the workspace back to any saved state. Inspect the target first.
+Create a save of the current state if it has anything worth keeping.
+
+```bash
+lupe restore <save-uuid>
+```
+
+### diff
+
+Compare any two saves. With no arguments, compares the two most recent saves
+in the current checkpoint.
+
+```bash
+lupe diff
+lupe diff <from-save-uuid> <to-save-uuid>
+```
+
+### respond
+
+Attach the agent's response text to the latest checkpoint. Called automatically
+by the stop hook when hooks are installed.
+
+```bash
+lupe respond "full agent response"
+```
+
+### push
+
+Stage everything, commit using the latest checkpoint title as the message, and
+push to the git remote. Optional — only useful when the workspace is a git repo.
+
+```bash
+lupe push
+lupe push --message "override commit message"
+```
+
+## Read Commands
+
+```bash
+lupe status                   # show active database and object store paths
+lupe history                  # list checkpoints
+lupe prompts                  # list checkpoints with prompts and responses
+lupe saves                    # list saves (all, or pass a checkpoint uuid)
+lupe graph                    # colored terminal graph of checkpoints and saves
+lupe search "query"           # full-text search across titles, prompts, responses
+```
+
+## Setup
+
+```bash
+lupe install-hooks            # wire the stop hook into Claude Code, Codex, Cursor
+lupe install-agent            # append Lupe workflow instructions to AGENTS.md
+```
 
 ## Agent Instructions
 
