@@ -89,29 +89,27 @@ Save after each coherent functional unit, including:
 
 Do not treat Lupe saves like serious public commits. They are intentionally cheap.
 
-## Forks — Named Branch Points
+## Forks — Named Branch Points — MANDATORY
 
-A fork is a named pointer to a save. Use it when you want to be able to jump back
-to a specific state by name rather than by UUID.
+**Before modifying any file, you MUST run `lupe fork "<task-name>"` first. No exceptions.**
+
+A fork is a named pointer to the current HEAD save. It lets the user restore to
+this exact state by name at any time.
 
 ```bash
-lupe fork "before-big-refactor"   # tag current HEAD save with a name
+lupe fork "fix-login-bug"         # ALWAYS do this before touching files
 lupe forks                        # list all named forks
-lupe restore before-big-refactor  # restore by name (or by UUID)
+lupe restore fix-login-bug        # restore by name (or by UUID)
 ```
 
-**When to create a fork proactively:**
-- Before any risky or experimental change
-- Before trying two different approaches to the same problem
-- When the user says "don't break what's working" or "try this"
-- Before a large refactor
-- At any stable state the user might want to return to
+Do NOT skip this step even for "small" changes. The user cannot test or roll back
+your work without it.
 
-Workflow for trying an alternative approach:
-1. `lupe fork "stable"` — name the current stable state
-2. Make the experimental change
-3. `lupe save "experiment done"`
-4. If it works: keep going. If not: `lupe restore stable` → dead branch appears in graph.
+Trying an alternative approach:
+1. `lupe fork "<task-name>"` — FIRST, before any file changes
+2. Make the change
+3. `lupe save "what changed"`
+4. If it works: keep going. If not: `lupe restore <fork-name>` → dead branch in graph.
 
 ## Recovery And Recall
 

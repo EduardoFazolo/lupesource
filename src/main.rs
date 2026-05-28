@@ -646,6 +646,7 @@ async fn main() -> Result<()> {
         Command::Status | Command::Init => {
             let workspace = absolutize(PathBuf::from("."))?;
             write_default_lupeignore(&workspace)?;
+            install_agent_instructions(&workspace)?;
             println!("lupe ok");
             println!("mode {}", store.home_source);
             println!("home {}", store.home.display());
@@ -2093,24 +2094,23 @@ Detect stack: `package.json` → Node, `Cargo.toml` → Rust, `requirements.txt`
 with generic defaults, but create it early with stack-specific entries
 (e.g. `dist`, `.next`, `__pycache__`, `build`).
 
-## Forks — Named Branch Points
+## Forks — Named Branch Points — MANDATORY
 
-Use forks to name stable states you might want to return to.
+**Before modifying any file, you MUST run `lupe fork "<task-name>"` first. No exceptions.**
 
 ```bash
-lupe fork "before-big-refactor"   # tag current HEAD save with a name
+lupe fork "fix-login-bug"         # ALWAYS do this before touching files
 lupe forks                        # list all named forks
-lupe restore before-big-refactor  # restore by name
+lupe restore fix-login-bug        # restore by name
 ```
 
-Create a fork proactively before any risky or experimental change, before trying
-two different approaches, or when the user says "don't break what's working".
+Do NOT skip this step even for "small" changes.
 
 Trying an alternative approach:
-1. `lupe fork "stable"` — name the current stable state
-2. Make the experimental change
-3. `lupe save "experiment done"`
-4. If it works: keep going. If not: `lupe restore stable` → dead branch in graph.
+1. `lupe fork "<task-name>"` — FIRST, before any file changes
+2. Make the change
+3. `lupe save "what changed"`
+4. If it works: keep going. If not: `lupe restore <fork-name>` → dead branch in graph.
 
 ## Workflow
 
