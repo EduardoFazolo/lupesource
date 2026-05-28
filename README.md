@@ -95,9 +95,15 @@ lupe search "query"           # full-text search across titles, prompts, respons
 ## Setup
 
 ```bash
-lupe install-hooks            # wire the stop hook into Claude Code, Codex, Cursor
-lupe install-agent            # append Lupe workflow instructions to AGENTS.md
+lupe install                  # configure this workspace and agent stop hooks
+lupe install --workspace PATH # configure another workspace
+lupe install-hooks            # only wire stop hooks into Claude Code, Codex, Cursor
+lupe install-agent            # only append Lupe workflow instructions to AGENTS.md
 ```
+
+`lupe install` records the current `lupe` binary path in hook commands with
+`LUPE_BIN=...`, so hooks do not depend on a hardcoded user-specific path. The
+hook script still falls back to `lupe` on `PATH` and then `~/.cargo/bin/lupe`.
 
 ## Agent Instructions
 
@@ -109,5 +115,5 @@ There is also a portable skill draft at [skills/lupe-agent/SKILL.md](skills/lupe
 To add Lupe instructions to another workspace:
 
 ```bash
-lupe install-agent
+lupe install --workspace /path/to/workspace
 ```

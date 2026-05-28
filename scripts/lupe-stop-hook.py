@@ -6,10 +6,15 @@ Works with Claude Code, Codex CLI, and Cursor.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
-LUPE = os.environ.get("LUPE_BIN", "/Users/eduardoverona/.cargo/bin/lupe")
+LUPE = (
+    os.environ.get("LUPE_BIN")
+    or shutil.which("lupe")
+    or os.path.expanduser("~/.cargo/bin/lupe")
+)
 
 
 def run_lupe(*args: str) -> bool:
