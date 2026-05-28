@@ -95,12 +95,35 @@ enum Command {
     },
     InstallHooks,
     Status,
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     Author {
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         email: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    New {
+        name: String,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
+    List,
+    Drop {
+        name: String,
+    },
+}
+
+struct WorkspaceInfo {
+    name: String,
+    path: PathBuf,
+    head: Option<Uuid>,
 }
 
 struct Store {
@@ -212,6 +235,7 @@ async fn main() -> Result<()> {
                 }
             }
             let workspace = absolutize(workspace)?;
+            write_default_lupeignore(&workspace)?;
             let title = title.unwrap_or_else(|| title_from_prompt(&prompt));
             let agent = detect_agent(agent);
             let (checkpoint, save) = store.create_checkpoint(title, prompt, agent, &workspace).await?;
@@ -552,6 +576,30 @@ async fn main() -> Result<()> {
                 (None, None) => println!("author not configured"),
             }
         }
+        Command::Workspace { action } => match action {
+            WorkspaceAction::New { name, workspace } => {
+                let workspace = absolutize(workspace)?;
+                let ws_dir = store.create_workspace(&name, &workspace).await?;
+                println!("workspace '{name}' created");
+                println!("path {}", ws_dir.display());
+                println!("cd into it to work or test independently");
+            }
+            WorkspaceAction::List => {
+                let workspaces = store.list_workspaces()?;
+                if workspaces.is_empty() {
+                    println!("no workspaces — run: lupe workspace new <name>");
+                } else {
+                    for ws in workspaces {
+                        let head = ws.head.map(|h| short_id(h)).unwrap_or_else(|| "?".to_string());
+                        println!("{} head={} {}", ws.name, head, ws.path.display());
+                    }
+                }
+            }
+            WorkspaceAction::Drop { name } => {
+                store.drop_workspace(&name)?;
+                println!("workspace '{name}' dropped");
+            }
+        },
         Command::Author { name, email } => {
             let mut author = store.read_author();
             let setting = name.is_some() || email.is_some();
@@ -1042,6 +1090,89 @@ impl Store {
             .and_then(parse_uuid)
     }
 
+    fn workspaces_root(&self) -> PathBuf {
+        self.home.join("workspaces")
+    }
+
+    async fn create_workspace(&self, name: &str, source_workspace: &FsPath) -> Result<PathBuf> {
+        let ws_dir = self.workspaces_root().join(name);
+        if ws_dir.exists() {
+            bail!("workspace '{name}' already exists at {}", ws_dir.display());
+        }
+
+        let shared = read_lupeshared(source_workspace);
+        let head = self.read_head().ok_or_else(|| anyhow!("no HEAD — run lupe prompt first"))?;
+        let manifest = self.get_manifest(head).await?;
+
+        fs::create_dir_all(&ws_dir)?;
+
+        // Copy tracked files from object store
+        for file in &manifest.files {
+            let dest = ws_dir.join(&file.path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let src = object_path(&self.object_dir, &file.hash)?;
+            fs::copy(src, &dest)?;
+        }
+
+        // Symlink .lupeshared entries from source workspace
+        for shared_path in &shared {
+            let target = source_workspace.join(shared_path);
+            let link = ws_dir.join(shared_path);
+            if target.exists() && !link.exists() {
+                if let Some(parent) = link.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &link)?;
+            }
+        }
+
+        // Symlink config files so workspace inherits ignore rules
+        for config in &[".lupeignore", ".lupeshared"] {
+            let target = source_workspace.join(config);
+            let link = ws_dir.join(config);
+            if target.exists() && !link.exists() {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &link)?;
+            }
+        }
+
+        fs::write(ws_dir.join(".lupe-head"), head.to_string())?;
+        Ok(ws_dir)
+    }
+
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+        let root = self.workspaces_root();
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut workspaces = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
+                let head = fs::read_to_string(path.join(".lupe-head"))
+                    .ok()
+                    .and_then(|s| Uuid::parse_str(s.trim()).ok());
+                workspaces.push(WorkspaceInfo { name, path, head });
+            }
+        }
+        workspaces.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(workspaces)
+    }
+
+    fn drop_workspace(&self, name: &str) -> Result<()> {
+        let ws_dir = self.workspaces_root().join(name);
+        if !ws_dir.exists() {
+            bail!("workspace '{name}' not found");
+        }
+        fs::remove_dir_all(&ws_dir)?;
+        Ok(())
+    }
+
     fn author_path(&self) -> PathBuf {
         self.home.join("author.json")
     }
@@ -1260,11 +1391,12 @@ fn snapshot_workspace(workspace: &FsPath, object_dir: &FsPath) -> Result<Snapsho
         bail!("workspace is not a directory: {}", workspace.display());
     }
 
+    let ignore = read_lupeignore(workspace);
     let mut files = Vec::new();
     for entry in WalkDir::new(workspace).follow_links(false) {
         let entry = entry?;
         let path = entry.path();
-        if should_skip(workspace, path) || !entry.file_type().is_file() {
+        if should_skip(workspace, path, &ignore) || !entry.file_type().is_file() {
             continue;
         }
 
@@ -1300,6 +1432,7 @@ fn restore_manifest(manifest: &Manifest, object_dir: &FsPath, workspace: &FsPath
     if !workspace.is_dir() {
         bail!("workspace is not a directory: {}", workspace.display());
     }
+    let ignore = read_lupeignore(workspace);
     let wanted: BTreeSet<&str> = manifest
         .files
         .iter()
@@ -1312,7 +1445,7 @@ fn restore_manifest(manifest: &Manifest, object_dir: &FsPath, workspace: &FsPath
     {
         let entry = entry?;
         let path = entry.path();
-        if should_skip(workspace, path) {
+        if should_skip(workspace, path, &ignore) {
             continue;
         }
         if entry.file_type().is_file() {
@@ -1337,13 +1470,56 @@ fn restore_manifest(manifest: &Manifest, object_dir: &FsPath, workspace: &FsPath
     Ok(())
 }
 
-fn should_skip(workspace: &FsPath, path: &FsPath) -> bool {
+const DEFAULT_IGNORE: &[&str] = &[".git", ".lupe", "target", "node_modules"];
+
+fn read_lupeignore(workspace: &FsPath) -> Vec<String> {
+    let path = workspace.join(".lupeignore");
+    match fs::read_to_string(&path) {
+        Ok(content) => content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => DEFAULT_IGNORE.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn read_lupeshared(workspace: &FsPath) -> Vec<String> {
+    let path = workspace.join(".lupeshared");
+    match fs::read_to_string(&path) {
+        Ok(content) => content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn write_default_lupeignore(workspace: &FsPath) -> Result<()> {
+    let path = workspace.join(".lupeignore");
+    if !path.exists() {
+        fs::write(
+            &path,
+            "# Lupe ignore — files and directories lupe will not snapshot\n\
+             .git\n\
+             .lupe\n\
+             target\n\
+             node_modules\n",
+        )?;
+    }
+    Ok(())
+}
+
+fn should_skip(workspace: &FsPath, path: &FsPath, ignore: &[String]) -> bool {
     let Ok(rel) = path.strip_prefix(workspace) else {
         return true;
     };
     rel.components().any(|component| {
         let s = component.as_os_str().to_string_lossy();
-        matches!(s.as_ref(), ".git" | ".lupe" | "target" | "node_modules")
+        ignore.iter().any(|pattern| s.as_ref() == pattern.as_str())
     })
 }
 

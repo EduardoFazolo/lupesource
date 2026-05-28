@@ -1,0 +1,5 @@
+# Lupe ignore — files and directories lupe will not snapshot
+.git
+.lupe
+target
+node_modules
