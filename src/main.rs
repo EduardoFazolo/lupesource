@@ -344,13 +344,14 @@ async fn main() -> Result<()> {
                 }
             }
 
-            for (index, checkpoint) in checkpoints.iter().enumerate() {
+            let head_checkpoint_id = main_chain_ids.first().copied();
+
+            for (index, checkpoint) in checkpoints.iter().rev().enumerate() {
                 if index > 0 {
                     println!("{}", colors.dim("│"));
                 }
                 let is_head_checkpoint = head_save.is_some()
-                    && index == 0
-                    && main_chain_set.contains(&checkpoint.id);
+                    && Some(checkpoint.id) == head_checkpoint_id;
                 let head_marker = if is_head_checkpoint { " [HEAD]" } else { "" };
                 println!(
                     "{} {} {} {} {}{}",
@@ -677,6 +678,19 @@ impl Store {
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await?;
+
+        for file in &snapshot.manifest.files {
+            sqlx::query(
+                "insert into save_files (save_id, path, hash, size) values (?1, ?2, ?3, ?4)",
+            )
+            .bind(save_id.to_string())
+            .bind(&file.path)
+            .bind(&file.hash)
+            .bind(file.len as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
 
         self.write_head(save_id)?;
@@ -724,6 +738,7 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
 
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             insert into saves
@@ -740,9 +755,22 @@ impl Store {
         .bind(snapshot.file_count)
         .bind(manifest)
         .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        for file in &snapshot.manifest.files {
+            sqlx::query(
+                "insert into save_files (save_id, path, hash, size) values (?1, ?2, ?3, ?4)",
+            )
+            .bind(save_id.to_string())
+            .bind(&file.path)
+            .bind(&file.hash)
+            .bind(file.len as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         self.write_head(save_id)?;
 
         Ok(SaveView {
@@ -859,12 +887,6 @@ impl Store {
             .await?
         };
         rows.into_iter().map(save_from_row).collect()
-    }
-
-    async fn diff_saves(&self, from: Uuid, to: Uuid) -> Result<DiffView> {
-        let from_manifest = self.get_manifest(from).await?;
-        let to_manifest = self.get_manifest(to).await?;
-        Ok(diff_manifests(from, to, &from_manifest, &to_manifest))
     }
 
     async fn resolve_diff_range(
@@ -1051,11 +1073,63 @@ impl Store {
     }
 
     async fn get_manifest(&self, id: Uuid) -> Result<Manifest> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "select path, hash, size from save_files where save_id = ?1 order by path",
+        )
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        if !rows.is_empty() {
+            return Ok(Manifest {
+                files: rows
+                    .into_iter()
+                    .map(|(path, hash, len)| FileEntry { path, hash, len: len as u64 })
+                    .collect(),
+            });
+        }
+
+        // Legacy: fall back to manifest JSON blob for saves before migration
         let value: String = sqlx::query_scalar("select manifest from saves where id = ?1")
             .bind(id.to_string())
             .fetch_one(&self.pool)
             .await?;
         Ok(serde_json::from_str(&value)?)
+    }
+
+    async fn diff_saves(&self, from: Uuid, to: Uuid) -> Result<DiffView> {
+        let added: Vec<String> = sqlx::query_scalar(
+            "select path from save_files where save_id = ?1
+             and path not in (select path from save_files where save_id = ?2)
+             order by path",
+        )
+        .bind(to.to_string())
+        .bind(from.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let removed: Vec<String> = sqlx::query_scalar(
+            "select path from save_files where save_id = ?1
+             and path not in (select path from save_files where save_id = ?2)
+             order by path",
+        )
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let modified: Vec<String> = sqlx::query_scalar(
+            "select sf1.path from save_files sf1
+             join save_files sf2 on sf1.path = sf2.path and sf2.save_id = ?2
+             where sf1.save_id = ?1 and sf1.hash != sf2.hash
+             order by sf1.path",
+        )
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(DiffView { from, to, added, modified, removed })
     }
 }
 
@@ -1085,6 +1159,16 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         "create index if not exists checkpoints_created_at_idx on checkpoints (created_at desc)",
         "create index if not exists saves_created_at_idx on saves (created_at desc)",
         "create index if not exists saves_checkpoint_sequence_idx on saves (checkpoint_id, sequence)",
+        r#"
+        create table if not exists save_files (
+            save_id text not null references saves(id) on delete cascade,
+            path text not null,
+            hash text not null,
+            size integer not null default 0,
+            primary key (save_id, path)
+        )
+        "#,
+        "create index if not exists save_files_path_idx on save_files (path, save_id)",
     ];
 
     for statement in statements {
@@ -1123,6 +1207,33 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         sqlx::query("alter table checkpoints add column parent_save_id text references saves(id)")
             .execute(pool)
             .await?;
+    }
+
+    // Populate save_files from existing manifest blobs for saves not yet migrated
+    let unmigrated: Vec<(String, String)> = sqlx::query_as(
+        "select id, manifest from saves
+         where id not in (select distinct save_id from save_files)
+         and manifest != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for (save_id, manifest_json) in unmigrated {
+        let manifest: Manifest = match serde_json::from_str(&manifest_json) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        for file in manifest.files {
+            sqlx::query(
+                "insert or ignore into save_files (save_id, path, hash, size) values (?1, ?2, ?3, ?4)",
+            )
+            .bind(&save_id)
+            .bind(&file.path)
+            .bind(&file.hash)
+            .bind(file.len as i64)
+            .execute(pool)
+            .await?;
+        }
     }
 
     Ok(())
@@ -1184,39 +1295,6 @@ fn snapshot_workspace(workspace: &FsPath, object_dir: &FsPath) -> Result<Snapsho
     })
 }
 
-fn diff_manifests(from: Uuid, to: Uuid, a: &Manifest, b: &Manifest) -> DiffView {
-    let a_files: BTreeMap<&str, &str> = a
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file.hash.as_str()))
-        .collect();
-    let b_files: BTreeMap<&str, &str> = b
-        .files
-        .iter()
-        .map(|file| (file.path.as_str(), file.hash.as_str()))
-        .collect();
-    let paths: BTreeSet<&str> = a_files.keys().chain(b_files.keys()).copied().collect();
-
-    let mut added = Vec::new();
-    let mut modified = Vec::new();
-    let mut removed = Vec::new();
-    for path in paths {
-        match (a_files.get(path), b_files.get(path)) {
-            (None, Some(_)) => added.push(path.to_string()),
-            (Some(_), None) => removed.push(path.to_string()),
-            (Some(a_hash), Some(b_hash)) if a_hash != b_hash => modified.push(path.to_string()),
-            _ => {}
-        }
-    }
-
-    DiffView {
-        from,
-        to,
-        added,
-        modified,
-        removed,
-    }
-}
 
 fn restore_manifest(manifest: &Manifest, object_dir: &FsPath, workspace: &FsPath) -> Result<()> {
     if !workspace.is_dir() {
