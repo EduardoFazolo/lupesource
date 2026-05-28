@@ -32,6 +32,8 @@ enum Command {
         title: Option<String>,
         #[arg(long)]
         prev_response: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
@@ -39,6 +41,8 @@ enum Command {
         title: String,
         #[arg(long)]
         prompt: String,
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
@@ -98,6 +102,7 @@ struct CheckpointView {
     title: String,
     prompt: Option<String>,
     response: Option<String>,
+    agent: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -149,6 +154,24 @@ struct Snapshot {
     manifest: Manifest,
 }
 
+fn detect_agent(override_val: Option<String>) -> String {
+    if let Some(v) = override_val {
+        return v;
+    }
+    if let Ok(v) = std::env::var("LUPE_AGENT") {
+        return v;
+    }
+    let name = if std::env::var("CLAUDE_CODE_VERSION").is_ok() {
+        "claude-code"
+    } else if std::env::var("CURSOR_EDITOR").is_ok() {
+        "cursor"
+    } else {
+        "unknown"
+    };
+    let model = std::env::var("LUPE_AGENT_MODEL").unwrap_or_else(|_| "unknown".to_string());
+    format!("{name}/{model}")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -159,6 +182,7 @@ async fn main() -> Result<()> {
             prompt,
             title,
             prev_response,
+            agent,
             workspace,
         } => {
             if let Some(response) = prev_response {
@@ -168,7 +192,8 @@ async fn main() -> Result<()> {
             }
             let workspace = absolutize(workspace)?;
             let title = title.unwrap_or_else(|| title_from_prompt(&prompt));
-            let (checkpoint, save) = store.create_checkpoint(title, prompt, &workspace).await?;
+            let agent = detect_agent(agent);
+            let (checkpoint, save) = store.create_checkpoint(title, prompt, agent, &workspace).await?;
             println!(
                 "prompt {} ({}) {}",
                 short_id(checkpoint.id),
@@ -187,10 +212,12 @@ async fn main() -> Result<()> {
         Command::Checkpoint {
             title,
             prompt,
+            agent,
             workspace,
         } => {
             let workspace = absolutize(workspace)?;
-            let (checkpoint, save) = store.create_checkpoint(title, prompt, &workspace).await?;
+            let agent = detect_agent(agent);
+            let (checkpoint, save) = store.create_checkpoint(title, prompt, agent, &workspace).await?;
             println!(
                 "checkpoint {} ({}) {}",
                 short_id(checkpoint.id),
@@ -222,13 +249,16 @@ async fn main() -> Result<()> {
         Command::History => {
             for checkpoint in store.list_checkpoints().await? {
                 println!(
-                    "{} ({})  {}  {}\n  prompt: {}",
+                    "{} ({})  {}  {}",
                     short_id(checkpoint.id),
                     checkpoint.id,
                     checkpoint.created_at.format("%Y-%m-%d %H:%M:%S"),
                     checkpoint.title,
-                    one_line(checkpoint.prompt.as_deref().unwrap_or(""))
                 );
+                if let Some(agent) = &checkpoint.agent {
+                    println!("  agent: {agent}");
+                }
+                println!("  prompt: {}", one_line(checkpoint.prompt.as_deref().unwrap_or("")));
             }
         }
         Command::Saves { checkpoint } => {
@@ -254,6 +284,9 @@ async fn main() -> Result<()> {
                     checkpoint.created_at.format("%Y-%m-%d %H:%M:%S"),
                     checkpoint.title
                 );
+                if let Some(agent) = checkpoint.agent {
+                    println!("agent: {agent}");
+                }
                 println!("prompt: {}", checkpoint.prompt.unwrap_or_default());
                 if let Some(response) = checkpoint.response {
                     println!("response: {response}");
@@ -286,6 +319,14 @@ async fn main() -> Result<()> {
                     colors.dim("prompt:"),
                     one_line(checkpoint.prompt.as_deref().unwrap_or(""))
                 );
+                if let Some(agent) = &checkpoint.agent {
+                    println!(
+                        "{} {} {}",
+                        colors.dim("│"),
+                        colors.dim("agent:"),
+                        agent
+                    );
+                }
 
                 let saves = store.list_saves(Some(checkpoint.id)).await?;
                 for (save_index, save) in saves.iter().enumerate() {
@@ -423,6 +464,7 @@ impl Store {
         &self,
         title: String,
         prompt: String,
+        agent: String,
         workspace: &FsPath,
     ) -> Result<(CheckpointView, SaveView)> {
         let checkpoint_id = Uuid::now_v7();
@@ -434,13 +476,14 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            insert into checkpoints (id, title, prompt, created_at)
-            values (?1, ?2, ?3, ?4)
+            insert into checkpoints (id, title, prompt, agent, created_at)
+            values (?1, ?2, ?3, ?4, ?5)
             "#,
         )
         .bind(checkpoint_id.to_string())
         .bind(&title)
         .bind(&prompt)
+        .bind(&agent)
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
         .await?;
@@ -469,6 +512,7 @@ impl Store {
                 title,
                 prompt: Some(prompt),
                 response: None,
+                agent: Some(agent),
                 created_at: now,
             },
             SaveView {
@@ -536,7 +580,7 @@ impl Store {
 
     async fn list_checkpoints(&self) -> Result<Vec<CheckpointView>> {
         let rows = sqlx::query(
-            "select id, title, prompt, response, created_at from checkpoints order by created_at desc",
+            "select id, title, prompt, response, agent, created_at from checkpoints order by created_at desc",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -760,6 +804,17 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
             .await?;
     }
 
+    let has_agent: bool = sqlx::query_scalar(
+        "select count(*) > 0 from pragma_table_info('checkpoints') where name = 'agent'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_agent {
+        sqlx::query("alter table checkpoints add column agent text")
+            .execute(pool)
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -919,6 +974,7 @@ fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CheckpointView> {
         title: row.try_get("title")?,
         prompt: row.try_get("prompt")?,
         response: row.try_get("response")?,
+        agent: row.try_get("agent")?,
         created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
     })
 }

@@ -25,13 +25,14 @@ def run_lupe(*args: str) -> bool:
         return False
 
 
-def extract_messages(path: str) -> tuple[str | None, str | None]:
-    """Return (last_user_text, last_assistant_text) from a transcript JSONL."""
+def extract_messages(path: str) -> tuple[str | None, str | None, str | None]:
+    """Return (last_user_text, last_assistant_text, model) from a transcript JSONL."""
     if not path or not os.path.exists(path):
-        return None, None
+        return None, None, None
 
     last_user = None
     last_assistant = None
+    model = None
 
     try:
         with open(path) as f:
@@ -44,6 +45,9 @@ def extract_messages(path: str) -> tuple[str | None, str | None]:
                     msg = entry.get("message", {}) or {}
                     role = msg.get("role") or entry.get("role")
                     content = msg.get("content") or entry.get("content", [])
+
+                    if model is None:
+                        model = msg.get("model") or entry.get("model")
 
                     if isinstance(content, list):
                         texts = [
@@ -71,7 +75,20 @@ def extract_messages(path: str) -> tuple[str | None, str | None]:
     except Exception:
         pass
 
-    return last_user, last_assistant
+    return last_user, last_assistant, model
+
+
+def detect_agent(payload: dict, model: str | None) -> str:
+    agent_name = os.environ.get("LUPE_AGENT_NAME")
+    if not agent_name:
+        if "transcript_path" in payload:
+            agent_name = "claude-code"
+        elif payload.get("last_assistant_message"):
+            agent_name = "codex"
+        else:
+            agent_name = "unknown"
+    agent_model = os.environ.get("LUPE_AGENT_MODEL") or model or "unknown"
+    return f"{agent_name}/{agent_model}"
 
 
 def main() -> None:
@@ -86,16 +103,18 @@ def main() -> None:
     assistant_text = payload.get("last_assistant_message")
 
     # Parse transcript for user message (and assistant if not provided)
-    user_text, transcript_assistant = extract_messages(transcript_path)
+    user_text, transcript_assistant, model = extract_messages(transcript_path)
     if not assistant_text:
         assistant_text = transcript_assistant
 
     if not assistant_text or not assistant_text.strip():
         sys.exit(0)
 
+    agent = detect_agent(payload, model)
+
     # Create checkpoint for this turn (user prompt → workspace snapshot)
     if user_text and user_text.strip():
-        run_lupe("prompt", user_text.strip())
+        run_lupe("prompt", user_text.strip(), "--agent", agent)
 
     # Attach agent response to that checkpoint
     run_lupe("respond", assistant_text.strip())
