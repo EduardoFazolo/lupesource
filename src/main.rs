@@ -1,14 +1,18 @@
 use anyhow::{Context, Result, anyhow, bail};
+use axum::{Json, Router, body::Body, extract::{Query, State}, http::{Response, header}, response::IntoResponse, routing::get};
+use rust_embed::RustEmbed;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path as FsPath, PathBuf},
+    sync::Arc,
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -84,6 +88,10 @@ enum Command {
         all: bool,
         #[arg(long, help = "Reveal private checkpoint titles and prompts")]
         show_private: bool,
+        #[arg(long, help = "Open interactive graph in browser")]
+        web: bool,
+        #[arg(long, default_value = "4747", help = "Port for --web server")]
+        port: u16,
     },
     #[command(about = "Show file changes between two saves. Defaults to last two saves if omitted.")]
     Diff {
@@ -154,13 +162,13 @@ enum Command {
     #[command(about = "Print the contents of a file as it existed in a checkpoint. Useful for comparing across forks.")]
     Cat {
         file: String,
-        checkpoint: Uuid,
+        checkpoint: String,
         #[arg(long, help = "Read from a specific save instead of the checkpoint's latest save")]
         from_save: Option<Uuid>,
     },
     #[command(about = "List all files tracked in a checkpoint (or specific save). Useful before a merge to see what each fork contains.")]
     Files {
-        checkpoint: Uuid,
+        checkpoint: String,
         #[arg(long, help = "List files from a specific save instead of the checkpoint's latest save")]
         from_save: Option<Uuid>,
     },
@@ -225,6 +233,78 @@ struct SaveView {
     root_hash: String,
     file_count: i64,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebSaveData {
+    id: Uuid,
+    sequence: i64,
+    message: Option<String>,
+    file_count: i64,
+    root_hash: String,
+    created_at: DateTime<Utc>,
+    diff_added: i64,
+    diff_modified: i64,
+    diff_removed: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct WebCheckpointData {
+    id: Uuid,
+    title: String,
+    prompt: Option<String>,
+    response: Option<String>,
+    agent: Option<String>,
+    session_id: Option<String>,
+    parent_save_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    #[serde(rename = "private")]
+    is_private: bool,
+    is_head: bool,
+    is_main_chain: bool,
+    saves: Vec<WebSaveData>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebGraphData {
+    checkpoints: Vec<WebCheckpointData>,
+    head_save_id: Option<Uuid>,
+    project_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DiffQuery {
+    from: Option<String>,
+    to: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WebDiffLine {
+    kind: String, // "context" | "added" | "removed"
+    content: String,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebHunk {
+    old_start: u32,
+    new_start: u32,
+    lines: Vec<WebDiffLine>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebFileDiff {
+    path: String,
+    status: String, // "added" | "modified" | "removed"
+    is_binary: bool,
+    hunks: Vec<WebHunk>,
+}
+
+struct AppState {
+    pool: SqlitePool,
+    object_dir: PathBuf,
+    graph_json: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -340,6 +420,22 @@ FORKS & WORKSPACES
   lupe workspace new <fork>     Create an isolated directory for parallel agent work.
   lupe workspace list           List active workspaces.
   lupe workspace drop <name>    Remove a workspace.
+
+  Workspaces are isolated directories at .lupe/workspaces/<name>/.
+  Files are copied from the fork's save state. Lupe checkpoints and
+  saves made inside a workspace are tracked in the shared lupe store.
+
+  .lupeshared — list paths to SYMLINK into every workspace instead of copy.
+  Use this for large shared dirs (node_modules, .venv, .env) so workspaces
+  don't duplicate them. Example .lupeshared:
+    node_modules
+    .env
+
+  To run a dev server from a workspace, cd into the workspace dir and run
+  your dev command normally. node_modules will be available via symlink if
+  .lupeshared is configured. Use a different port than main (e.g. --port 3002).
+
+  NEVER copy workspace files into main manually. Use lupe merge workflow instead.
 
 SETUP
 -----
@@ -491,7 +587,11 @@ async fn main() -> Result<()> {
                 println!();
             }
         }
-        Command::Graph { no_color, all, show_private } => {
+        Command::Graph { no_color, all, show_private, web, port } => {
+            if web {
+                serve_web_graph(&store, all, show_private, port).await?;
+                return Ok(());
+            }
             let colors = Colors::new(!no_color);
             let head_save = store.read_head();
             let main_chain_ids = store.main_chain_checkpoint_ids().await?;
@@ -860,9 +960,10 @@ async fn main() -> Result<()> {
             }
         },
         Command::Cat { file, checkpoint, from_save } => {
+            let checkpoint_id = store.resolve_checkpoint_id(&checkpoint).await?;
             let save_id = match from_save {
                 Some(id) => id,
-                None => store.latest_save_for_checkpoint(checkpoint).await?,
+                None => store.latest_save_for_checkpoint(checkpoint_id).await?,
             };
             let manifest = store.get_manifest(save_id).await?;
             let entry = manifest.files.iter().find(|f| f.path == file)
@@ -873,9 +974,10 @@ async fn main() -> Result<()> {
             print!("{content}");
         }
         Command::Files { checkpoint, from_save } => {
+            let checkpoint_id = store.resolve_checkpoint_id(&checkpoint).await?;
             let save_id = match from_save {
                 Some(id) => id,
-                None => store.latest_save_for_checkpoint(checkpoint).await?,
+                None => store.latest_save_for_checkpoint(checkpoint_id).await?,
             };
             let manifest = store.get_manifest(save_id).await?;
             for f in &manifest.files {
@@ -1485,6 +1587,21 @@ impl Store {
             });
         }
         Ok(result)
+    }
+
+    async fn resolve_checkpoint_id(&self, s: &str) -> Result<Uuid> {
+        if let Ok(id) = Uuid::parse_str(s) {
+            return Ok(id);
+        }
+        let pattern = format!("{}%", s);
+        let id: Option<String> = sqlx::query_scalar(
+            "select id from checkpoints where id like ?1 limit 1",
+        )
+        .bind(&pattern)
+        .fetch_optional(&self.pool)
+        .await?;
+        id.ok_or_else(|| anyhow!("no checkpoint matching '{s}'"))
+            .and_then(parse_uuid)
     }
 
     async fn resolve_fork_name(&self, name: &str) -> Result<Uuid> {
@@ -2476,6 +2593,301 @@ Lupe does not automatically see prompts unless the agent or host calls Lupe.
 This file is the contract that tells agents when to call it.
 <!-- /lupe-agent-workflow -->
 "#
+}
+
+#[derive(RustEmbed)]
+#[folder = "web/dist"]
+struct WebDist;
+
+async fn handle_static(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    match WebDist::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(file.data))
+                .unwrap()
+        }
+        None => Response::builder()
+            .header(header::CONTENT_TYPE, "text/html")
+            .body(Body::from(WebDist::get("index.html").map(|f| f.data).unwrap_or_default()))
+            .unwrap(),
+    }
+}
+
+async fn diff_file_counts(
+    pool: &SqlitePool,
+    from_id: Option<Uuid>,
+    to_id: Uuid,
+) -> Result<(i64, i64, i64)> {
+    let to = to_id.to_string();
+    let from = from_id.map(|id| id.to_string());
+
+    let added: i64 = if let Some(ref f) = from {
+        sqlx::query_scalar(
+            "select count(*) from save_files where save_id=?1
+             and path not in (select path from save_files where save_id=?2)",
+        )
+        .bind(&to).bind(f).fetch_one(pool).await?
+    } else {
+        sqlx::query_scalar("select count(*) from save_files where save_id=?1")
+            .bind(&to).fetch_one(pool).await?
+    };
+
+    let removed: i64 = if let Some(ref f) = from {
+        sqlx::query_scalar(
+            "select count(*) from save_files where save_id=?1
+             and path not in (select path from save_files where save_id=?2)",
+        )
+        .bind(f).bind(&to).fetch_one(pool).await?
+    } else { 0 };
+
+    let modified: i64 = if let Some(ref f) = from {
+        sqlx::query_scalar(
+            "select count(*) from save_files a
+             join save_files b on a.path=b.path
+             where a.save_id=?1 and b.save_id=?2 and a.hash!=b.hash",
+        )
+        .bind(f).bind(&to).fetch_one(pool).await?
+    } else { 0 };
+
+    Ok((added, modified, removed))
+}
+
+async fn serve_web_graph(store: &Store, all: bool, show_private: bool, port: u16) -> Result<()> {
+    let checkpoints = store.list_checkpoints(all, show_private).await?;
+    let main_chain_ids = store.main_chain_checkpoint_ids().await?;
+    let main_chain_set: std::collections::HashSet<Uuid> = main_chain_ids.iter().copied().collect();
+    let head_save = store.read_head();
+    let head_checkpoint_id = main_chain_ids.first().copied();
+
+    let mut web_checkpoints: Vec<WebCheckpointData> = Vec::new();
+    for cp in &checkpoints {
+        let saves = store.list_saves(Some(cp.id)).await?;
+        let is_head_cp = head_checkpoint_id == Some(cp.id);
+        let mut web_saves: Vec<WebSaveData> = Vec::new();
+        for (i, s) in saves.iter().enumerate() {
+            let from_id = if i > 0 {
+                Some(saves[i - 1].id)
+            } else {
+                cp.parent_save_id
+            };
+            let (diff_added, diff_modified, diff_removed) =
+                diff_file_counts(&store.pool, from_id, s.id).await?;
+            web_saves.push(WebSaveData {
+                id: s.id,
+                sequence: s.sequence,
+                message: s.message.clone(),
+                file_count: s.file_count,
+                root_hash: s.root_hash.clone(),
+                created_at: s.created_at,
+                diff_added,
+                diff_modified,
+                diff_removed,
+            });
+        }
+        web_checkpoints.push(WebCheckpointData {
+            id: cp.id,
+            title: cp.title.clone(),
+            prompt: cp.prompt.clone(),
+            response: cp.response.clone(),
+            agent: cp.agent.clone(),
+            session_id: cp.session_id.clone(),
+            parent_save_id: cp.parent_save_id,
+            created_at: cp.created_at,
+            is_private: cp.private,
+            is_head: is_head_cp,
+            is_main_chain: main_chain_set.contains(&cp.id),
+            saves: web_saves,
+        });
+    }
+
+    let project_name = store.home.parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "project".to_string());
+
+    let graph_data = WebGraphData {
+        checkpoints: web_checkpoints,
+        head_save_id: head_save,
+        project_name,
+    };
+
+    let state = Arc::new(AppState {
+        pool: store.pool.clone(),
+        object_dir: store.object_dir.clone(),
+        graph_json: serde_json::to_value(&graph_data)?,
+    });
+
+    let app = Router::new()
+        .route("/api/graph", get(handle_graph))
+        .route("/api/diff", get(handle_diff))
+        .fallback(handle_static)
+        .with_state(state);
+
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let url = format!("http://localhost:{port}");
+    println!("lupe graph — opening {url}");
+    println!("ctrl+c to stop");
+    let _ = open::that(&url);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handle_graph(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(state.graph_json.clone())
+}
+
+async fn handle_diff(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DiffQuery>,
+) -> Result<Json<Vec<WebFileDiff>>, axum::http::StatusCode> {
+    let to_id = Uuid::parse_str(&params.to)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    let from_id = params.from.as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    compute_web_diff(&state.pool, &state.object_dir, from_id, to_id)
+        .await
+        .map(Json)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn compute_web_diff(
+    pool: &SqlitePool,
+    object_dir: &FsPath,
+    from_save_id: Option<Uuid>,
+    to_save_id: Uuid,
+) -> Result<Vec<WebFileDiff>> {
+    // Fetch manifests for both saves
+    let to_files: Vec<(String, String)> = sqlx::query_as(
+        "select path, hash from save_files where save_id = ?1 order by path",
+    )
+    .bind(to_save_id.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    let from_files: Vec<(String, String)> = if let Some(from_id) = from_save_id {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "select path, hash from save_files where save_id = ?1 order by path",
+        )
+        .bind(from_id.to_string())
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            // Legacy save: read from manifest JSON blob
+            let manifest_json: Option<String> = sqlx::query_scalar(
+                "select manifest from saves where id = ?1",
+            )
+            .bind(from_id.to_string())
+            .fetch_optional(pool)
+            .await?;
+            if let Some(json) = manifest_json {
+                if let Ok(m) = serde_json::from_str::<Manifest>(&json) {
+                    m.files.into_iter().map(|f| (f.path, f.hash)).collect()
+                } else { vec![] }
+            } else { vec![] }
+        } else {
+            rows
+        }
+    } else {
+        vec![]
+    };
+
+    let from_map: BTreeMap<String, String> = from_files.into_iter().collect();
+    let to_map: BTreeMap<String, String> = to_files.into_iter().collect();
+
+    let mut all_paths: BTreeSet<String> = BTreeSet::new();
+    all_paths.extend(from_map.keys().cloned());
+    all_paths.extend(to_map.keys().cloned());
+
+    const MAX_FILE_BYTES: u64 = 256 * 1024;
+    let mut result: Vec<WebFileDiff> = Vec::new();
+
+    for path in &all_paths {
+        let old_hash = from_map.get(path);
+        let new_hash = to_map.get(path);
+
+        let status = match (old_hash, new_hash) {
+            (None, Some(_)) => "added",
+            (Some(_), None) => "removed",
+            (Some(a), Some(b)) if a == b => continue, // unchanged
+            _ => "modified",
+        };
+
+        let old_bytes = if let Some(hash) = old_hash {
+            let p = object_path(object_dir, hash)?;
+            let meta = fs::metadata(&p).unwrap_or_else(|_| fs::metadata(".").unwrap());
+            if meta.len() > MAX_FILE_BYTES {
+                result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: false, hunks: vec![] });
+                continue;
+            }
+            fs::read(&p).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let new_bytes = if let Some(hash) = new_hash {
+            let p = object_path(object_dir, hash)?;
+            let meta = fs::metadata(&p).unwrap_or_else(|_| fs::metadata(".").unwrap());
+            if meta.len() > MAX_FILE_BYTES {
+                result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: false, hunks: vec![] });
+                continue;
+            }
+            fs::read(&p).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        // Binary detection
+        let is_binary = old_bytes.iter().any(|&b| b == 0) || new_bytes.iter().any(|&b| b == 0);
+        if is_binary {
+            result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: true, hunks: vec![] });
+            continue;
+        }
+
+        let old_str = String::from_utf8_lossy(&old_bytes);
+        let new_str = String::from_utf8_lossy(&new_bytes);
+
+        let diff = TextDiff::from_lines(old_str.as_ref(), new_str.as_ref());
+        let mut hunks: Vec<WebHunk> = Vec::new();
+
+        for group in diff.grouped_ops(3) {
+            let mut lines: Vec<WebDiffLine> = Vec::new();
+            let mut old_start = 0u32;
+            let mut new_start = 0u32;
+            let mut first = true;
+
+            for op in &group {
+                for change in diff.iter_changes(op) {
+                    let old_line = change.old_index().map(|i| i as u32 + 1);
+                    let new_line = change.new_index().map(|i| i as u32 + 1);
+                    if first {
+                        old_start = old_line.unwrap_or(new_line.unwrap_or(1));
+                        new_start = new_line.unwrap_or(old_line.unwrap_or(1));
+                        first = false;
+                    }
+                    let kind = match change.tag() {
+                        ChangeTag::Equal => "context",
+                        ChangeTag::Insert => "added",
+                        ChangeTag::Delete => "removed",
+                    };
+                    let content = change.value().trim_end_matches('\n').to_string();
+                    lines.push(WebDiffLine { kind: kind.to_string(), content, old_line, new_line });
+                }
+            }
+            if !lines.is_empty() {
+                hunks.push(WebHunk { old_start, new_start, lines });
+            }
+        }
+
+        result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary, hunks });
+    }
+
+    Ok(result)
 }
 
 fn print_diff_lines(diff: &DiffView, colors: &Colors, pipe: &str, indent: &str) {
