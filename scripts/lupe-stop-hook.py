@@ -51,8 +51,9 @@ def extract_messages(path: str) -> tuple[str | None, str | None, str | None]:
                     role = msg.get("role") or entry.get("role")
                     content = msg.get("content") or entry.get("content", [])
 
-                    if model is None:
-                        model = msg.get("model") or entry.get("model")
+                    candidate = msg.get("model") or entry.get("model")
+                    if candidate:
+                        model = candidate
 
                     if isinstance(content, list):
                         texts = [
@@ -92,7 +93,12 @@ def detect_agent(payload: dict, model: str | None) -> str:
             agent_name = "codex"
         else:
             agent_name = "unknown"
-    agent_model = os.environ.get("LUPE_AGENT_MODEL") or model or "unknown"
+    agent_model = (
+        os.environ.get("LUPE_AGENT_MODEL")
+        or model
+        or payload.get("model")
+        or "unknown"
+    )
     return f"{agent_name}/{agent_model}"
 
 
@@ -165,8 +171,11 @@ def main() -> None:
     private = is_sensitive_custom(user_text or "") or is_sensitive_custom(assistant_text or "")
 
     # Create checkpoint for this turn (user prompt → workspace snapshot)
+    session_id = payload.get("session_id")
     if user_text and user_text.strip():
         args = ["prompt", user_text.strip(), "--agent", agent]
+        if session_id:
+            args += ["--session", session_id]
         if private:
             args.append("--private")
         run_lupe(*args)

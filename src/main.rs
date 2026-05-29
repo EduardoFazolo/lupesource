@@ -26,6 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Record a user prompt and snapshot the workspace. Called by the stop hook automatically.")]
     Prompt {
         prompt: String,
         #[arg(long)]
@@ -37,8 +38,11 @@ enum Command {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
         #[arg(long)]
+        session: Option<String>,
+        #[arg(long, help = "Mark this checkpoint private (hidden from history/graph by default)")]
         private: bool,
     },
+    #[command(about = "Create a named checkpoint manually with a title and prompt.")]
     Checkpoint {
         title: String,
         #[arg(long)]
@@ -48,49 +52,59 @@ enum Command {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    #[command(about = "Snapshot the current workspace state. Use after completing a meaningful unit of work.")]
     Save {
         message: Option<String>,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    #[command(about = "List checkpoints on the main chain. Use --all to include dead branches.")]
     History {
         #[arg(long)]
         all: bool,
-        #[arg(long)]
+        #[arg(long, help = "Include private checkpoints (hidden by default)")]
         show_private: bool,
     },
+    #[command(about = "List saves for a checkpoint. Shows the sequence of snapshots within one checkpoint.")]
     Saves {
         checkpoint: Option<Uuid>,
     },
+    #[command(about = "List checkpoints showing only the user prompt for each. Useful to quickly scan what was worked on.")]
     Prompts {
         #[arg(long)]
         all: bool,
         #[arg(long)]
         show_private: bool,
     },
+    #[command(about = "Visual tree of checkpoints and saves. Use --all to show dead branches (forked work).")]
     Graph {
         #[arg(long)]
         no_color: bool,
         #[arg(long)]
         all: bool,
-        #[arg(long)]
+        #[arg(long, help = "Reveal private checkpoint titles and prompts")]
         show_private: bool,
     },
+    #[command(about = "Show file changes between two saves. Defaults to last two saves if omitted.")]
     Diff {
         from: Option<Uuid>,
         to: Option<Uuid>,
     },
+    #[command(about = "Restore workspace files to a specific save state. Also accepts a fork name.")]
     Restore {
         save: String,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    #[command(about = "Full-text search across checkpoint titles, prompts, and responses.")]
     Search {
         query: String,
     },
+    #[command(about = "Attach an agent response to the latest checkpoint. Called by the stop hook automatically.")]
     Respond {
         response: String,
     },
+    #[command(about = "Install lupe hooks and agent instructions into a workspace.")]
     Install {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
@@ -101,51 +115,66 @@ enum Command {
         #[arg(long)]
         no_hooks: bool,
     },
+    #[command(about = "Install agent instructions (AGENTS.md) into a workspace.")]
     InstallAgent {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    #[command(about = "Push workspace changes to git remote with a lupe checkpoint message.")]
     Push {
         #[arg(long)]
         message: Option<String>,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
+    #[command(about = "Install the lupe stop hook into the global Claude Code hooks config.")]
     InstallHooks {
         #[arg(long)]
         lupe_bin: Option<PathBuf>,
     },
+    #[command(about = "Show current lupe status: HEAD save, workspace, and recent activity.")]
     Status,
+    #[command(about = "Alias for status. Initializes lupe in the current project if not already set up.")]
     Init,
+    #[command(about = "Set or update the title of the latest checkpoint.")]
     Title {
         title: String,
     },
+    #[command(about = "Create a named fork (branch point) at the current HEAD save. Use before risky or parallel work.")]
     Fork {
         name: String,
     },
+    #[command(about = "List all forks and the save they point to.")]
     Forks,
+    #[command(about = "Manage isolated workspaces for parallel agent work.")]
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    #[command(about = "Print the contents of a file as it existed in a checkpoint. Useful for comparing across forks.")]
     Cat {
         file: String,
         checkpoint: Uuid,
-        #[arg(long)]
+        #[arg(long, help = "Read from a specific save instead of the checkpoint's latest save")]
         from_save: Option<Uuid>,
     },
+    #[command(about = "List all files tracked in a checkpoint (or specific save). Useful before a merge to see what each fork contains.")]
     Files {
         checkpoint: Uuid,
-        #[arg(long)]
+        #[arg(long, help = "List files from a specific save instead of the checkpoint's latest save")]
         from_save: Option<Uuid>,
     },
+    #[command(about = "Flag the next checkpoint as private. Private checkpoints are hidden from history and graph by default.")]
     Private,
+    #[command(about = "Show or set the author name and email recorded on checkpoints.")]
     Author {
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
         email: Option<String>,
     },
+    #[command(about = "Print full reference documentation for all lupe commands. Agents should run this to understand available tools.")]
+    Docs,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +210,7 @@ struct CheckpointView {
     prompt: Option<String>,
     response: Option<String>,
     agent: Option<String>,
+    session_id: Option<String>,
     parent_save_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     private: bool,
@@ -265,6 +295,70 @@ fn detect_agent(override_val: Option<String>) -> String {
     format!("{name}/{model}")
 }
 
+const DOCS: &str = r#"
+LUPE — agent-native source control
+===================================
+Run `lupe <command> --help` for full flag details on any command.
+
+WORKFLOW
+--------
+Every agent session follows this pattern:
+
+  lupe prompt "<user prompt>"   — auto-called by stop hook. Records what was asked.
+  lupe save "<message>"         — snapshot workspace after completing a unit of work.
+  lupe fork <name>              — branch point before risky or parallel work.
+  lupe restore <save|fork>      — roll back to any saved state. Never edit files manually to undo.
+
+TRACKING
+--------
+  lupe prompt <text>            Record a user prompt + snapshot. --private to hide from history.
+  lupe checkpoint <title>       Create a named checkpoint manually.
+  lupe save [message]           Snapshot current workspace state.
+  lupe respond <text>           Attach agent response to latest checkpoint (called by hook).
+  lupe title <title>            Update the title of the latest checkpoint.
+  lupe private                  Flag the NEXT checkpoint as private.
+
+HISTORY & INSPECTION
+--------------------
+  lupe history [--all]          List checkpoints. --all includes dead branches.
+  lupe graph [--all]            Visual tree of checkpoints and saves.
+  lupe saves [checkpoint-id]    List saves within a checkpoint.
+  lupe prompts [--all]          List checkpoints showing only the user prompt.
+  lupe diff [from] [to]         File changes between two saves.
+  lupe search <query>           Full-text search across prompts, titles, responses.
+  lupe files <checkpoint-id>    List all files tracked in a checkpoint's latest save.
+  lupe cat <file> <checkpoint>  Print file contents as they existed in a checkpoint.
+                                Use --from-save <id> to read from a specific save instead.
+
+  Add --show-private to history, graph, or prompts to reveal private checkpoints.
+
+FORKS & WORKSPACES
+------------------
+  lupe fork <name>              Create a named fork at current HEAD (like a bookmark).
+  lupe forks                    List all forks.
+  lupe restore <fork-name>      Restore workspace to a fork's save state.
+  lupe workspace new <fork>     Create an isolated directory for parallel agent work.
+  lupe workspace list           List active workspaces.
+  lupe workspace drop <name>    Remove a workspace.
+
+SETUP
+-----
+  lupe status / lupe init       Show current state. Init lupe in a new project.
+  lupe install                  Install hooks + agent instructions into a workspace.
+  lupe author --name --email    Set author identity.
+
+MERGE WORKFLOW (manual, agent-driven)
+--------------------------------------
+To merge two forks:
+  1. lupe graph --all                         — identify the two fork tips
+  2. lupe diff <ancestor-save> <main-tip>     — what main changed
+  3. lupe diff <ancestor-save> <fork-tip>     — what fork changed
+  4. lupe files <fork-checkpoint>             — see all files in fork
+  5. lupe cat <file> <fork-checkpoint>        — read a specific file from fork
+  6. Resolve conflicts by writing files to disk
+  7. lupe save "merged <fork-name> into main"
+"#;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -277,6 +371,7 @@ async fn main() -> Result<()> {
             prev_response,
             agent,
             workspace,
+            session,
             private,
         } => {
             if let Some(response) = prev_response {
@@ -289,7 +384,7 @@ async fn main() -> Result<()> {
             let title = title.unwrap_or_else(|| title_from_prompt(&prompt));
             let agent = detect_agent(agent);
             let (checkpoint, save) = store
-                .create_checkpoint(title, prompt, agent, &workspace, private)
+                .create_checkpoint(title, prompt, agent, session, &workspace, private)
                 .await?;
             println!(
                 "prompt {} ({}) {}",
@@ -315,7 +410,7 @@ async fn main() -> Result<()> {
             let workspace = absolutize(workspace)?;
             let agent = detect_agent(agent);
             let (checkpoint, save) = store
-                .create_checkpoint(title, prompt, agent, &workspace, false)
+                .create_checkpoint(title, prompt, agent, None, &workspace, false)
                 .await?;
             println!(
                 "checkpoint {} ({}) {}",
@@ -479,7 +574,10 @@ async fn main() -> Result<()> {
                 );
                 if !checkpoint.private || show_private {
                     if let Some(agent) = &checkpoint.agent {
-                        println!("{} {} {}", colors.dim("│"), colors.dim("agent:"), agent);
+                        let session_suffix = checkpoint.session_id.as_deref()
+                            .map(|s| format!("  {}", colors.dim(&format!("session: {}", s))))
+                            .unwrap_or_default();
+                        println!("{} {} {}{}", colors.dim("│"), colors.dim("agent:"), agent, session_suffix);
                     }
                 }
 
@@ -821,6 +919,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Docs => {
+            print!("{}", DOCS);
+        }
     }
 
     Ok(())
@@ -875,6 +976,7 @@ impl Store {
         title: String,
         prompt: String,
         agent: String,
+        session_id: Option<String>,
         workspace: &FsPath,
         private: bool,
     ) -> Result<(CheckpointView, SaveView)> {
@@ -889,14 +991,15 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            insert into checkpoints (id, title, prompt, agent, parent_save_id, created_at)
-            values (?1, ?2, ?3, ?4, ?5, ?6)
+            insert into checkpoints (id, title, prompt, agent, session_id, parent_save_id, created_at)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
         )
         .bind(checkpoint_id.to_string())
         .bind(&title)
         .bind(&prompt)
         .bind(&agent)
+        .bind(&session_id)
         .bind(parent_save_id.map(|id| id.to_string()))
         .bind(now.to_rfc3339())
         .execute(&mut *tx)
@@ -946,6 +1049,7 @@ impl Store {
                 prompt: Some(prompt),
                 response: None,
                 agent: Some(agent),
+                session_id,
                 parent_save_id,
                 created_at: now,
                 private,
@@ -1061,9 +1165,9 @@ impl Store {
     async fn list_checkpoints(&self, all: bool, include_private: bool) -> Result<Vec<CheckpointView>> {
         if all {
             let sql = if include_private {
-                "select id, title, prompt, response, agent, parent_save_id, created_at, private from checkpoints order by created_at desc"
+                "select id, title, prompt, response, agent, session_id, parent_save_id, created_at, private from checkpoints order by created_at desc"
             } else {
-                "select id, title, prompt, response, agent, parent_save_id, created_at, private from checkpoints where private = 0 order by created_at desc"
+                "select id, title, prompt, response, agent, session_id, parent_save_id, created_at, private from checkpoints where private = 0 order by created_at desc"
             };
             let rows = sqlx::query(sql)
                 .fetch_all(&self.pool)
@@ -1075,9 +1179,9 @@ impl Store {
         if ids.is_empty() {
             // No HEAD yet — fall back to all by created_at
             let sql = if include_private {
-                "select id, title, prompt, response, agent, parent_save_id, created_at, private from checkpoints order by created_at desc"
+                "select id, title, prompt, response, agent, session_id, parent_save_id, created_at, private from checkpoints order by created_at desc"
             } else {
-                "select id, title, prompt, response, agent, parent_save_id, created_at, private from checkpoints where private = 0 order by created_at desc"
+                "select id, title, prompt, response, agent, session_id, parent_save_id, created_at, private from checkpoints where private = 0 order by created_at desc"
             };
             let rows = sqlx::query(sql)
                 .fetch_all(&self.pool)
@@ -1088,7 +1192,7 @@ impl Store {
         let mut result = Vec::with_capacity(ids.len());
         for id in &ids {
             let row = sqlx::query(
-                "select id, title, prompt, response, agent, parent_save_id, created_at, private from checkpoints where id = ?1",
+                "select id, title, prompt, response, agent, session_id, parent_save_id, created_at, private from checkpoints where id = ?1",
             )
             .bind(id.to_string())
             .fetch_one(&self.pool)
@@ -1665,6 +1769,17 @@ create table if not exists forks (
             .await?;
     }
 
+    let has_session_id: bool = sqlx::query_scalar(
+        "select count(*) > 0 from pragma_table_info('checkpoints') where name = 'session_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_session_id {
+        sqlx::query("alter table checkpoints add column session_id text")
+            .execute(pool)
+            .await?;
+    }
+
     // Populate save_files from existing manifest blobs for saves not yet migrated
     let unmigrated: Vec<(String, String)> = sqlx::query_as(
         "select id, manifest from saves
@@ -1953,6 +2068,7 @@ fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CheckpointView> {
         prompt: row.try_get("prompt")?,
         response: row.try_get("response")?,
         agent: row.try_get("agent")?,
+        session_id: row.try_get("session_id").unwrap_or(None),
         parent_save_id: optional_uuid(row.try_get("parent_save_id")?)?,
         created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
         private: row.try_get::<i64, _>("private").unwrap_or(0) != 0,
