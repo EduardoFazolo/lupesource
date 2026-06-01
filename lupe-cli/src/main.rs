@@ -330,7 +330,8 @@ async fn main() -> Result<()> {
             let colors = Colors::new(!no_color);
             let head_checkpoint = store.read_head();
 
-            let checkpoints = store.list_checkpoints(all, show_private).await?;
+            // Main chain always shows only main-branch checkpoints.
+            let checkpoints = store.list_checkpoints(false, show_private).await?;
             if checkpoints.is_empty() {
                 println!("no checkpoints yet");
                 return Ok(());

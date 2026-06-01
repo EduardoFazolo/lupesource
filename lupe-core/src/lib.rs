@@ -341,12 +341,25 @@ impl Store {
         private: bool,
     ) -> Result<CheckpointView> {
         let private = private || self.consume_next_private();
-        let parent_checkpoint_id = self.read_head();
         let checkpoint_id = Uuid::now_v7();
         let now = Utc::now();
         let snapshot = snapshot_workspace(workspace, &self.object_dir)?;
 
         let branch_name = read_workspace_branch(workspace);
+
+        // Use this branch's own head as parent, falling back to global HEAD.
+        let parent_checkpoint_id: Option<Uuid> = {
+            let branch_head: Option<String> = sqlx::query_scalar(
+                "select head_checkpoint_id from branches where name = ?1",
+            )
+            .bind(&branch_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            match branch_head.and_then(|s| Uuid::parse_str(&s).ok()) {
+                Some(id) => Some(id),
+                None => self.read_head(),
+            }
+        };
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -2082,6 +2095,39 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    let has_head_checkpoint_id: bool = sqlx::query_scalar(
+        "select count(*) > 0 from pragma_table_info('branches') where name = 'head_checkpoint_id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_head_checkpoint_id {
+        sqlx::query("alter table branches add column head_checkpoint_id text not null default ''")
+            .execute(pool)
+            .await?;
+    }
+
+    let has_branches_created_at: bool = sqlx::query_scalar(
+        "select count(*) > 0 from pragma_table_info('branches') where name = 'created_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_branches_created_at {
+        sqlx::query("alter table branches add column created_at text not null default ''")
+            .execute(pool)
+            .await?;
+    }
+
+    let has_branches_updated_at: bool = sqlx::query_scalar(
+        "select count(*) > 0 from pragma_table_info('branches') where name = 'updated_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_branches_updated_at {
+        sqlx::query("alter table branches add column updated_at text not null default ''")
+            .execute(pool)
+            .await?;
+    }
+
     let has_branch_name: bool = sqlx::query_scalar(
         "select count(*) > 0 from pragma_table_info('checkpoints') where name = 'branch_name'",
     )
@@ -2134,21 +2180,41 @@ pub async fn bootstrap_head_if_missing(store: &Store) -> Result<()> {
                 if let Some(cp_id) = cp_id {
                     if let Ok(uuid) = Uuid::parse_str(&cp_id) {
                         store.write_head(uuid)?;
-                        upsert_main_branch(&store.pool, uuid).await?;
+                        // Only update main branch if this checkpoint is on main.
+                        let branch: Option<String> = sqlx::query_scalar(
+                            "select branch_name from checkpoints where id = ?1",
+                        )
+                        .bind(uuid.to_string())
+                        .fetch_optional(&store.pool)
+                        .await?;
+                        if branch.as_deref().unwrap_or("main") == "main" {
+                            upsert_main_branch(&store.pool, uuid).await?;
+                        }
                         return Ok(());
                     }
                 }
             } else {
-                upsert_main_branch(&store.pool, id).await?;
+                // Only update main branch pointer if this HEAD checkpoint belongs to main.
+                let branch: Option<String> = sqlx::query_scalar(
+                    "select branch_name from checkpoints where id = ?1",
+                )
+                .bind(id.to_string())
+                .fetch_optional(&store.pool)
+                .await?;
+                if branch.as_deref().unwrap_or("main") == "main" {
+                    upsert_main_branch(&store.pool, id).await?;
+                }
             }
         }
         return Ok(());
     }
 
-    let latest: Option<String> =
-        sqlx::query_scalar("select id from checkpoints order by created_at desc limit 1")
-            .fetch_optional(&store.pool)
-            .await?;
+    // No HEAD file — bootstrap from latest main checkpoint.
+    let latest: Option<String> = sqlx::query_scalar(
+        "select id from checkpoints where branch_name = 'main' or branch_name is null order by created_at desc limit 1",
+    )
+    .fetch_optional(&store.pool)
+    .await?;
     if let Some(id) = latest {
         let uuid = parse_uuid(id)?;
         store.write_head(uuid)?;
