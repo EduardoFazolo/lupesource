@@ -341,14 +341,19 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Build map: parent_id → off-main-branch children (for --all display)
+            // Build maps for --all display:
+            //   branch_children: parent_id → direct non-main children (branch entry points)
+            //   all_children:    parent_id → ALL children (to follow full branch chains)
             let mut branch_children: std::collections::HashMap<Uuid, Vec<lupe_core::CheckpointView>> =
+                std::collections::HashMap::new();
+            let mut all_children: std::collections::HashMap<Uuid, Vec<lupe_core::CheckpointView>> =
                 std::collections::HashMap::new();
             if all {
                 let all_checkpoints = store.list_checkpoints(true, show_private).await?;
                 for c in all_checkpoints {
-                    if c.branch_name != "main" {
-                        if let Some(pcid) = c.parent_checkpoint_id {
+                    if let Some(pcid) = c.parent_checkpoint_id {
+                        all_children.entry(pcid).or_default().push(c.clone());
+                        if c.branch_name != "main" {
                             branch_children.entry(pcid).or_default().push(c);
                         }
                     }
@@ -427,29 +432,61 @@ async fn main() -> Result<()> {
                 }
 
                 if let Some(children) = branch_children.get(&checkpoint.id) {
-                    for (i, child) in children.iter().enumerate() {
-                        let is_last = i + 1 == children.len();
-                        let branch_pipe = if is_last { " " } else { "│" };
-                        println!("{}", colors.dim(&format!("{branch_pipe}  │")));
-                        println!(
-                            "{}",
-                            colors.branch(&format!(
-                                "{branch_pipe}  ╰─ ◆ branch: {} {} ({}) {} files={} root={}",
-                                child.branch_name,
-                                short_id(child.id),
-                                child.id,
-                                child.title,
-                                child.file_count,
-                                &child.root_hash[..12],
-                            ))
-                        );
-                        println!(
-                            "{}",
-                            colors.branch(&format!(
-                                "{branch_pipe}        prompt: {}",
-                                one_line(child.prompt.as_deref().unwrap_or(""))
-                            ))
-                        );
+                    for (i, entry) in children.iter().enumerate() {
+                        let is_last_branch = i + 1 == children.len();
+                        let branch_pipe = if is_last_branch { " " } else { "│" };
+
+                        // Walk the full chain for this branch from the entry point.
+                        let mut chain = vec![entry.clone()];
+                        let mut tip = entry.id;
+                        loop {
+                            let next: Vec<_> = all_children
+                                .get(&tip)
+                                .map(|v| v.iter().filter(|c| c.branch_name == entry.branch_name).collect())
+                                .unwrap_or_default();
+                            if next.is_empty() { break; }
+                            let n = next[0].clone();
+                            tip = n.id;
+                            chain.push(n);
+                        }
+
+                        for (j, node) in chain.iter().enumerate() {
+                            let is_first = j == 0;
+                            let indent = if is_first {
+                                format!("{branch_pipe}  ")
+                            } else {
+                                format!("{branch_pipe}     ")
+                            };
+                            println!("{}", colors.dim(&format!("{indent}│")));
+                            let connector = if is_first { "╰─ ◆" } else { "   ◆" };
+                            let branch_tag = if is_first {
+                                format!("branch: {} ", node.branch_name)
+                            } else {
+                                String::new()
+                            };
+                            println!(
+                                "{}",
+                                colors.branch(&format!(
+                                    "{indent}{connector} {}{} ({}) {} files={} root={}",
+                                    branch_tag,
+                                    short_id(node.id),
+                                    node.id,
+                                    node.title,
+                                    node.file_count,
+                                    &node.root_hash[..12],
+                                ))
+                            );
+                            if let Some(p) = node.prompt.as_deref().filter(|s| !s.is_empty()) {
+                                println!(
+                                    "{}",
+                                    colors.branch(&format!(
+                                        "{}         prompt: {}",
+                                        indent,
+                                        one_line(p)
+                                    ))
+                                );
+                            }
+                        }
                     }
                 }
             }

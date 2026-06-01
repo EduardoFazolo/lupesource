@@ -28,7 +28,7 @@ pub struct Store {
     pub object_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointView {
     pub id: Uuid,
     pub title: String,
