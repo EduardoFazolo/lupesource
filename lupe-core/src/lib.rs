@@ -194,10 +194,22 @@ BRANCHES & WORKSPACES
 ---------------------
   lupe branch <name>            Create a named branch at current HEAD.
   lupe branches                 List all branches.
+  lupe use <branch>             Set active branch for this directory. Writes .lupe-branch
+                                so ALL subsequent checkpoints (including auto-hook ones)
+                                go to that branch. Use 'main' to switch back.
   lupe restore <branch-name>    Restore workspace to a branch's head checkpoint.
   lupe workspace new <branch>   Create an isolated directory for parallel agent work.
   lupe workspace list           List active workspaces.
   lupe workspace drop <name>    Remove a workspace.
+
+  AGENT WORKFLOW — when asked to work on a branch:
+    1. lupe branch <name>          — create the branch
+    2. lupe use <name>             — route your checkpoints to it (REQUIRED)
+    3. ... do work, save files ...
+    4. lupe use main               — switch back when done
+
+  This ensures all auto-captured checkpoints (from the stop hook) go to the
+  right branch, not main. Without `lupe use`, the hook always writes to main.
 
   Workspaces are isolated directories at .lupe/workspaces/<name>/.
   Files are copied from the current HEAD state. Each workspace has a .lupe-branch
@@ -1682,21 +1694,29 @@ with generic defaults, but create it early with stack-specific entries
 
 ## Branches — MANDATORY
 
-**Before modifying any file, you MUST run `lupe branch "<task-name>"` first. No exceptions.**
+**Before modifying any file, you MUST create a branch and activate it. No exceptions.**
 
 ```bash
-lupe branch "fix-login-bug"       # ALWAYS do this before touching files
-lupe branches                     # list all branches
-lupe restore fix-login-bug        # restore by name
+lupe branch "fix-login-bug"       # 1. create branch
+lupe use fix-login-bug            # 2. REQUIRED: route your checkpoints to it
+# ... do work ...
+lupe use main                     # 3. switch back when done
 ```
 
-Do NOT skip this step even for "small" changes.
+`lupe use <branch>` writes `.lupe-branch` to the current directory so the
+auto-capture hook routes ALL checkpoints (including ones triggered by the
+stop hook) to the right branch instead of main. Without this step your
+work appears on main in the graph.
+
+Do NOT skip `lupe use` even for "small" changes.
 
 Trying an alternative approach:
-1. `lupe branch "<task-name>"` — FIRST, before any file changes
-2. Make the change
-3. `lupe save "what changed"`
-4. If it works: keep going. If not: `lupe restore <branch-name>` to roll back.
+1. `lupe branch "<task-name>"` — create branch
+2. `lupe use "<task-name>"` — activate it (REQUIRED)
+3. Make the change
+4. `lupe save "what changed"`
+5. If it works: keep going. If not: `lupe restore <branch-name>` to roll back.
+6. `lupe use main` — deactivate when done
 
 ## Workflow
 
@@ -1730,6 +1750,8 @@ lupe diff <checkpoint-uuid>
 lupe diff <from-uuid> <to-uuid>
 lupe restore <checkpoint-uuid-or-branch-name>
 lupe branch "name"
+lupe use "name"          # activate branch (routes hook checkpoints to it)
+lupe use main            # deactivate (back to main)
 lupe author
 lupe author --name "Name" --email "email"
 ```

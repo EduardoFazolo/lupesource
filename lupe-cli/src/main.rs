@@ -170,6 +170,10 @@ enum Command {
     },
     #[command(about = "Print full reference documentation for all lupe commands. Agents should run this to understand available tools.")]
     Docs,
+    #[command(about = "Set the active branch for this working directory. Writes .lupe-branch so all subsequent checkpoints (including hook-triggered ones) go to that branch. Use 'main' to switch back.")]
+    Use {
+        branch: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -662,6 +666,25 @@ async fn main() -> Result<()> {
         }
         Command::Docs => {
             print!("{}", DOCS);
+        }
+        Command::Use { branch } => {
+            let cwd = std::env::current_dir()?;
+            let branch_file = cwd.join(".lupe-branch");
+            if branch == "main" {
+                // Remove .lupe-branch so the directory reverts to main
+                if branch_file.exists() {
+                    std::fs::remove_file(&branch_file)?;
+                }
+                println!("now on main — .lupe-branch removed");
+            } else {
+                // Verify branch exists before committing
+                let branches = store.list_branches().await?;
+                if !branches.iter().any(|b| b.name == branch) {
+                    anyhow::bail!("branch '{}' not found — run: lupe branch {}", branch, branch);
+                }
+                std::fs::write(&branch_file, &branch)?;
+                println!("now on {} — checkpoints will go to this branch", branch);
+            }
         }
     }
 
