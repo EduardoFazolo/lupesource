@@ -18,7 +18,7 @@ use walkdir::WalkDir;
 pub struct WorkspaceInfo {
     pub name: String,
     pub path: PathBuf,
-    pub fork: String,
+    pub branch: String,
 }
 
 pub struct Store {
@@ -41,6 +41,7 @@ pub struct CheckpointView {
     pub file_count: i64,
     pub created_at: DateTime<Utc>,
     pub private: bool,
+    pub branch_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,7 +59,7 @@ pub struct WebCheckpointData {
     #[serde(rename = "private")]
     pub is_private: bool,
     pub is_head: bool,
-    pub is_main_chain: bool,
+    pub branch_name: String,
     pub diff_added: i64,
     pub diff_modified: i64,
     pub diff_removed: i64,
@@ -69,6 +70,7 @@ pub struct WebGraphData {
     pub checkpoints: Vec<WebCheckpointData>,
     pub head_checkpoint_id: Option<Uuid>,
     pub project_name: String,
+    pub branches: Vec<BranchView>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,10 +134,11 @@ pub struct SearchResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ForkView {
+pub struct BranchView {
     pub name: String,
-    pub checkpoint_id: Uuid,
+    pub head_checkpoint_id: Uuid,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 pub struct Snapshot {
@@ -161,10 +164,10 @@ WORKFLOW
 --------
 Every agent session follows this pattern:
 
-  lupe prompt "<user prompt>"   — auto-called by stop hook. Records what was asked.
-  lupe save "<message>"         — snapshot workspace as a new checkpoint.
-  lupe fork <name>              — branch point before risky or parallel work.
-  lupe restore <checkpoint|fork> — roll back to any checkpoint. Never edit files manually to undo.
+  lupe prompt "<user prompt>"      — auto-called by stop hook. Records what was asked.
+  lupe save "<message>"            — snapshot workspace as a new checkpoint.
+  lupe branch <name>               — create a named branch at current HEAD.
+  lupe restore <checkpoint|branch> — roll back to any checkpoint. Never edit files manually to undo.
 
 TRACKING
 --------
@@ -177,7 +180,7 @@ TRACKING
 
 HISTORY & INSPECTION
 --------------------
-  lupe history [--all]          List checkpoints. --all includes dead branches.
+  lupe history [--all]          List checkpoints. --all includes all branches.
   lupe graph [--all]            Visual tree of checkpoints.
   lupe prompts [--all]          List checkpoints showing only the user prompt.
   lupe diff [from] [to]         File changes between two checkpoints.
@@ -187,18 +190,18 @@ HISTORY & INSPECTION
 
   Add --show-private to history, graph, or prompts to reveal private checkpoints.
 
-FORKS & WORKSPACES
-------------------
-  lupe fork <name>              Create a named fork at current HEAD (like a bookmark).
-  lupe forks                    List all forks.
-  lupe restore <fork-name>      Restore workspace to a fork's checkpoint state.
-  lupe workspace new <fork>     Create an isolated directory for parallel agent work.
+BRANCHES & WORKSPACES
+---------------------
+  lupe branch <name>            Create a named branch at current HEAD.
+  lupe branches                 List all branches.
+  lupe restore <branch-name>    Restore workspace to a branch's head checkpoint.
+  lupe workspace new <branch>   Create an isolated directory for parallel agent work.
   lupe workspace list           List active workspaces.
   lupe workspace drop <name>    Remove a workspace.
 
   Workspaces are isolated directories at .lupe/workspaces/<name>/.
-  Files are copied from the fork's checkpoint state. Lupe checkpoints
-  made inside a workspace are tracked in the shared lupe store.
+  Files are copied from the current HEAD state. Each workspace has a .lupe-branch
+  file that routes lupe checkpoints to the correct branch automatically.
 
   .lupeshared — list paths to SYMLINK into every workspace instead of copy.
   Use this for large shared dirs (node_modules, .venv, .env) so workspaces
@@ -220,14 +223,14 @@ SETUP
 
 MERGE WORKFLOW (manual, agent-driven)
 --------------------------------------
-To merge two forks:
-  1. lupe graph --all                               — identify the two fork tips
-  2. lupe diff <ancestor-checkpoint> <main-tip>     — what main changed
-  3. lupe diff <ancestor-checkpoint> <fork-tip>     — what fork changed
-  4. lupe files <fork-checkpoint>                   — see all files in fork
-  5. lupe cat <file> <fork-checkpoint>              — read a specific file from fork
+To merge two branches:
+  1. lupe graph --all                                  — identify the two branch tips
+  2. lupe diff <ancestor-checkpoint> <main-tip>        — what main changed
+  3. lupe diff <ancestor-checkpoint> <branch-tip>      — what branch changed
+  4. lupe files <branch-checkpoint>                    — see all files in branch
+  5. lupe cat <file> <branch-checkpoint>               — read a specific file from branch
   6. Resolve conflicts by writing files to disk
-  7. lupe save "merged <fork-name> into main"
+  7. lupe save "merged <branch-name> into main"
 "#;
 
 // ── Colors (CLI display helper) ───────────────────────────────────────────────
@@ -253,7 +256,7 @@ impl Colors {
         self.paint("1", value)
     }
 
-    pub fn dead(&self, value: &str) -> String {
+    pub fn branch(&self, value: &str) -> String {
         self.paint("2;33", value)
     }
 
@@ -343,12 +346,14 @@ impl Store {
         let now = Utc::now();
         let snapshot = snapshot_workspace(workspace, &self.object_dir)?;
 
+        let branch_name = read_workspace_branch(workspace);
+
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             insert into checkpoints
-                (id, title, prompt, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at)
-            values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (id, title, prompt, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, branch_name)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )
         .bind(checkpoint_id.to_string())
@@ -360,6 +365,7 @@ impl Store {
         .bind(&snapshot.root_hash)
         .bind(snapshot.file_count)
         .bind(now.to_rfc3339())
+        .bind(&branch_name)
         .execute(&mut *tx)
         .await?;
 
@@ -378,6 +384,22 @@ impl Store {
         tx.commit().await?;
 
         self.write_head(checkpoint_id)?;
+        // Signal file watched by lupe-server SSE — fires for any branch, not just main.
+        let _ = fs::write(self.home.join("tick"), checkpoint_id.to_string());
+
+        // Advance this branch's head pointer (upsert so new branches auto-register).
+        let now_str = now.to_rfc3339();
+        sqlx::query(
+            r#"insert into branches (name, head_checkpoint_id, created_at, updated_at)
+               values (?1, ?2, ?3, ?3)
+               on conflict(name) do update set head_checkpoint_id = excluded.head_checkpoint_id,
+                                               updated_at = excluded.updated_at"#,
+        )
+        .bind(&branch_name)
+        .bind(checkpoint_id.to_string())
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
 
         if private {
             self.mark_private(checkpoint_id).await?;
@@ -395,78 +417,28 @@ impl Store {
             file_count: snapshot.file_count,
             created_at: now,
             private,
+            branch_name,
         })
     }
 
     pub async fn main_chain_checkpoint_ids(&self) -> Result<Vec<Uuid>> {
-        let mut result = Vec::new();
-        let mut current = self.read_head();
-        loop {
-            let Some(checkpoint_id) = current else { break };
-            let exists: bool = sqlx::query_scalar(
-                "select count(*) > 0 from checkpoints where id = ?1",
-            )
-            .bind(checkpoint_id.to_string())
-            .fetch_one(&self.pool)
-            .await?;
-            if !exists {
-                break;
-            }
-            if result.contains(&checkpoint_id) {
-                break;
-            }
-            result.push(checkpoint_id);
-            let parent: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-                "select parent_checkpoint_id from checkpoints where id = ?1",
-            )
-            .bind(checkpoint_id.to_string())
-            .fetch_one(&self.pool)
-            .await?;
-            current = parent.and_then(|s| Uuid::parse_str(&s).ok());
-        }
-        Ok(result)
+        let ids: Vec<String> = sqlx::query_scalar(
+            "select id from checkpoints where branch_name = 'main' order by created_at desc",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        ids.into_iter().map(parse_uuid).collect()
     }
 
     pub async fn list_checkpoints(&self, all: bool, include_private: bool) -> Result<Vec<CheckpointView>> {
-        if all {
-            let sql = if include_private {
-                "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private from checkpoints order by created_at desc"
-            } else {
-                "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private from checkpoints where private = 0 order by created_at desc"
-            };
-            let rows = sqlx::query(sql)
-                .fetch_all(&self.pool)
-                .await?;
-            return rows.into_iter().map(checkpoint_from_row).collect();
-        }
-
-        let ids = self.main_chain_checkpoint_ids().await?;
-        if ids.is_empty() {
-            let sql = if include_private {
-                "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private from checkpoints order by created_at desc"
-            } else {
-                "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private from checkpoints where private = 0 order by created_at desc"
-            };
-            let rows = sqlx::query(sql)
-                .fetch_all(&self.pool)
-                .await?;
-            return rows.into_iter().map(checkpoint_from_row).collect();
-        }
-
-        let mut result = Vec::with_capacity(ids.len());
-        for id in &ids {
-            let row = sqlx::query(
-                "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private from checkpoints where id = ?1",
-            )
-            .bind(id.to_string())
-            .fetch_one(&self.pool)
-            .await?;
-            let cp = checkpoint_from_row(row)?;
-            if include_private || !cp.private {
-                result.push(cp);
-            }
-        }
-        Ok(result)
+        let sql = match (all, include_private) {
+            (true,  true)  => "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private, branch_name from checkpoints order by created_at desc",
+            (true,  false) => "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private, branch_name from checkpoints where private = 0 order by created_at desc",
+            (false, true)  => "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private, branch_name from checkpoints where branch_name = 'main' order by created_at desc",
+            (false, false) => "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private, branch_name from checkpoints where branch_name = 'main' and private = 0 order by created_at desc",
+        };
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
+        rows.into_iter().map(checkpoint_from_row).collect()
     }
 
     fn next_private_path(&self) -> PathBuf {
@@ -577,7 +549,7 @@ impl Store {
 
     pub async fn get_checkpoint(&self, id: Uuid) -> Result<CheckpointView> {
         let row = sqlx::query(
-            "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private from checkpoints where id = ?1",
+            "select id, title, prompt, response, agent, session_id, parent_checkpoint_id, root_hash, file_count, created_at, private, branch_name from checkpoints where id = ?1",
         )
         .bind(id.to_string())
         .fetch_one(&self.pool)
@@ -642,36 +614,53 @@ impl Store {
             .and_then(parse_uuid)
     }
 
-    pub async fn create_fork(&self, name: String) -> Result<ForkView> {
-        let checkpoint_id = self.read_head()
+    pub async fn create_branch(&self, name: String) -> Result<BranchView> {
+        let head_checkpoint_id = self.read_head()
             .ok_or_else(|| anyhow!("no HEAD — run lupe prompt first"))?;
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
         sqlx::query(
-            "insert or replace into forks (name, checkpoint_id, created_at) values (?1, ?2, ?3)",
+            r#"insert into branches (name, head_checkpoint_id, created_at, updated_at)
+               values (?1, ?2, ?3, ?3)
+               on conflict(name) do update set head_checkpoint_id = excluded.head_checkpoint_id,
+                                               updated_at = excluded.updated_at"#,
         )
         .bind(&name)
-        .bind(checkpoint_id.to_string())
-        .bind(now.to_rfc3339())
+        .bind(head_checkpoint_id.to_string())
+        .bind(&now_str)
         .execute(&self.pool)
         .await?;
-        Ok(ForkView { name, checkpoint_id, created_at: now })
+        Ok(BranchView { name, head_checkpoint_id, created_at: now, updated_at: now })
     }
 
-    pub async fn list_forks(&self) -> Result<Vec<ForkView>> {
+    pub async fn list_branches(&self) -> Result<Vec<BranchView>> {
         let rows = sqlx::query(
-            "select name, checkpoint_id, created_at from forks order by created_at desc",
+            "select name, head_checkpoint_id, created_at, updated_at from branches order by updated_at desc",
         )
         .fetch_all(&self.pool)
         .await?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(ForkView {
+            result.push(BranchView {
                 name: row.try_get("name")?,
-                checkpoint_id: parse_uuid(row.try_get::<String, _>("checkpoint_id")?)?,
+                head_checkpoint_id: parse_uuid(row.try_get::<String, _>("head_checkpoint_id")?)?,
                 created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
+                updated_at: parse_time(row.try_get::<String, _>("updated_at")?)?,
             });
         }
         Ok(result)
+    }
+
+    pub async fn resolve_branch_name(&self, name: &str) -> Result<Uuid> {
+        let head_checkpoint_id: Option<String> = sqlx::query_scalar(
+            "select head_checkpoint_id from branches where name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        head_checkpoint_id
+            .ok_or_else(|| anyhow!("no branch named '{name}'"))
+            .and_then(parse_uuid)
     }
 
     pub async fn resolve_checkpoint_id(&self, s: &str) -> Result<Uuid> {
@@ -689,23 +678,12 @@ impl Store {
             .and_then(parse_uuid)
     }
 
-    pub async fn resolve_fork_name(&self, name: &str) -> Result<Uuid> {
-        let checkpoint_id: Option<String> = sqlx::query_scalar(
-            "select checkpoint_id from forks where name = ?1",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
-        checkpoint_id
-            .ok_or_else(|| anyhow!("no fork named '{name}'"))
-            .and_then(parse_uuid)
-    }
-
-    pub async fn create_workspace(&self, fork_name: &str, source_workspace: &FsPath) -> Result<PathBuf> {
-        let checkpoint_id = self.resolve_fork_name(fork_name).await?;
-        let ws_dir = self.home.join("workspaces").join(fork_name);
+    pub async fn create_workspace(&self, branch_name: &str, source_workspace: &FsPath) -> Result<PathBuf> {
+        let checkpoint_id = self.read_head()
+            .ok_or_else(|| anyhow!("no HEAD — run lupe prompt first"))?;
+        let ws_dir = self.home.join("workspaces").join(branch_name);
         if ws_dir.exists() {
-            bail!("workspace '{fork_name}' already exists — drop it first with: lupe workspace drop {fork_name}");
+            bail!("workspace '{branch_name}' already exists — drop it first with: lupe workspace drop {branch_name}");
         }
 
         let shared = read_lupeshared(source_workspace);
@@ -743,7 +721,22 @@ impl Store {
         }
 
         fs::write(ws_dir.join(".lupe-head"), checkpoint_id.to_string())?;
-        fs::write(ws_dir.join(".lupe-fork"), fork_name)?;
+        fs::write(ws_dir.join(".lupe-branch"), branch_name)?;
+
+        // Register the branch pointing to the starting checkpoint.
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"insert into branches (name, head_checkpoint_id, created_at, updated_at)
+               values (?1, ?2, ?3, ?3)
+               on conflict(name) do update set head_checkpoint_id = excluded.head_checkpoint_id,
+                                               updated_at = excluded.updated_at"#,
+        )
+        .bind(branch_name)
+        .bind(checkpoint_id.to_string())
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
         Ok(ws_dir)
     }
 
@@ -758,9 +751,12 @@ impl Store {
             if entry.file_type()?.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let path = entry.path();
-                let fork = fs::read_to_string(path.join(".lupe-fork"))
-                    .unwrap_or_else(|_| name.clone());
-                workspaces.push(WorkspaceInfo { name, path, fork });
+                let branch = fs::read_to_string(path.join(".lupe-branch"))
+                    .or_else(|_| fs::read_to_string(path.join(".lupe-fork")))
+                    .unwrap_or_else(|_| name.clone())
+                    .trim()
+                    .to_string();
+                workspaces.push(WorkspaceInfo { name, path, branch });
             }
         }
         workspaces.sort_by(|a, b| a.name.cmp(&b.name));
@@ -892,17 +888,13 @@ impl Store {
 
     pub async fn build_web_graph_data(&self, all: bool, show_private: bool) -> Result<WebGraphData> {
         let checkpoints = self.list_checkpoints(all, show_private).await?;
-        let main_chain_ids = self.main_chain_checkpoint_ids().await?;
-        let main_chain_set: std::collections::HashSet<Uuid> = main_chain_ids.iter().copied().collect();
-        let head_checkpoint = self.read_head();
-        let head_checkpoint_id = main_chain_ids.first().copied();
+        let head_checkpoint_id = self.read_head();
 
         let mut web_checkpoints: Vec<WebCheckpointData> = Vec::new();
         for cp in &checkpoints {
             let is_head_cp = head_checkpoint_id == Some(cp.id);
-            let from_id = cp.parent_checkpoint_id;
             let (diff_added, diff_modified, diff_removed) =
-                diff_file_counts(&self.pool, from_id, cp.id).await?;
+                diff_file_counts(&self.pool, cp.parent_checkpoint_id, cp.id).await?;
             web_checkpoints.push(WebCheckpointData {
                 id: cp.id,
                 title: cp.title.clone(),
@@ -916,7 +908,7 @@ impl Store {
                 created_at: cp.created_at,
                 is_private: cp.private,
                 is_head: is_head_cp,
-                is_main_chain: main_chain_set.contains(&cp.id),
+                branch_name: cp.branch_name.clone(),
                 diff_added,
                 diff_modified,
                 diff_removed,
@@ -928,10 +920,13 @@ impl Store {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
 
+        let branches = self.list_branches().await?;
+
         Ok(WebGraphData {
             checkpoints: web_checkpoints,
-            head_checkpoint_id: head_checkpoint,
+            head_checkpoint_id,
             project_name,
+            branches,
         })
     }
 }
@@ -1232,6 +1227,7 @@ pub fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CheckpointVie
         file_count: row.try_get::<Option<i64>, _>("file_count").unwrap_or(None).unwrap_or(0),
         created_at: parse_time(row.try_get::<String, _>("created_at")?)?,
         private: row.try_get::<i64, _>("private").unwrap_or(0) != 0,
+        branch_name: row.try_get::<Option<String>, _>("branch_name").unwrap_or(None).unwrap_or_else(|| "main".to_string()),
     })
 }
 
@@ -1266,6 +1262,13 @@ pub fn read_lupeignore(workspace: &FsPath) -> Vec<String> {
             .collect(),
         Err(_) => DEFAULT_IGNORE.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+pub fn read_workspace_branch(workspace: &FsPath) -> String {
+    fs::read_to_string(workspace.join(".lupe-branch"))
+        .unwrap_or_else(|_| "main".to_string())
+        .trim()
+        .to_string()
 }
 
 pub fn read_lupeshared(workspace: &FsPath) -> Vec<String> {
@@ -1664,23 +1667,23 @@ Detect stack: `package.json` → Node, `Cargo.toml` → Rust, `requirements.txt`
 with generic defaults, but create it early with stack-specific entries
 (e.g. `dist`, `.next`, `__pycache__`, `build`).
 
-## Forks — Named Branch Points — MANDATORY
+## Branches — MANDATORY
 
-**Before modifying any file, you MUST run `lupe fork "<task-name>"` first. No exceptions.**
+**Before modifying any file, you MUST run `lupe branch "<task-name>"` first. No exceptions.**
 
 ```bash
-lupe fork "fix-login-bug"         # ALWAYS do this before touching files
-lupe forks                        # list all named forks
+lupe branch "fix-login-bug"       # ALWAYS do this before touching files
+lupe branches                     # list all branches
 lupe restore fix-login-bug        # restore by name
 ```
 
 Do NOT skip this step even for "small" changes.
 
 Trying an alternative approach:
-1. `lupe fork "<task-name>"` — FIRST, before any file changes
+1. `lupe branch "<task-name>"` — FIRST, before any file changes
 2. Make the change
 3. `lupe save "what changed"`
-4. If it works: keep going. If not: `lupe restore <fork-name>` → dead branch in graph.
+4. If it works: keep going. If not: `lupe restore <branch-name>` to roll back.
 
 ## Workflow
 
@@ -1700,21 +1703,20 @@ Save after each coherent functional unit, before risky changes, after tests pass
 and before restore/destructive operations.
 
 **Never revert work by editing files manually. Always use `lupe restore`.**
-This preserves dropped work as a dead branch visible in `lupe graph`.
 
 Useful commands:
 
 ```bash
 lupe history
 lupe prompts
-lupe forks
+lupe branches
 lupe graph
 lupe search "<topic>"
 lupe diff
 lupe diff <checkpoint-uuid>
 lupe diff <from-uuid> <to-uuid>
-lupe restore <checkpoint-uuid-or-fork-name>
-lupe fork "name"
+lupe restore <checkpoint-uuid-or-branch-name>
+lupe branch "name"
 lupe author
 lupe author --name "Name" --email "email"
 ```
@@ -2067,67 +2069,42 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         }
     }
 
-    let forks_has_checkpoint_id: bool = sqlx::query_scalar(
-        "select count(*) > 0 from pragma_table_info('forks') where name = 'checkpoint_id'",
+    // ── Branches ──────────────────────────────────────────────────────────────
+
+    sqlx::query(r#"
+        create table if not exists branches (
+            name text primary key,
+            head_checkpoint_id text not null,
+            created_at text not null,
+            updated_at text not null
+        )
+    "#)
+    .execute(pool)
+    .await?;
+
+    let has_branch_name: bool = sqlx::query_scalar(
+        "select count(*) > 0 from pragma_table_info('checkpoints') where name = 'branch_name'",
     )
     .fetch_one(pool)
     .await?;
-
-    let forks_has_save_id: bool = sqlx::query_scalar(
-        "select count(*) > 0 from pragma_table_info('forks') where name = 'save_id'",
-    )
-    .fetch_one(pool)
-    .await?;
-
-    if !forks_has_checkpoint_id {
-        sqlx::query("alter table forks add column checkpoint_id text")
+    if !has_branch_name {
+        sqlx::query("alter table checkpoints add column branch_name text")
             .execute(pool)
             .await?;
-
-        if forks_has_save_id {
-            let fork_rows: Vec<(String, String)> = sqlx::query_as(
-                "select name, save_id from forks where save_id is not null",
-            )
-            .fetch_all(pool)
-            .await?;
-
-            for (name, save_id) in &fork_rows {
-                let owner: Option<String> = sqlx::query_scalar(
-                    "select checkpoint_id from saves where id = ?1",
-                )
-                .bind(save_id)
-                .fetch_optional(pool)
-                .await?;
-
-                if let Some(cp_id) = owner {
-                    sqlx::query(
-                        "update forks set checkpoint_id = ?1 where name = ?2",
-                    )
-                    .bind(&cp_id)
-                    .bind(name)
-                    .execute(pool)
-                    .await?;
-                }
-            }
-        }
     }
 
-    let forks_table_exists: bool = sqlx::query_scalar(
-        "select count(*) > 0 from sqlite_master where type='table' and name='forks'",
+    // One-time migration: walk HEAD backwards and mark those checkpoints as 'main'.
+    let needs_branch: Vec<String> = sqlx::query_scalar(
+        "select id from checkpoints where branch_name is null",
     )
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await?;
 
-    if !forks_table_exists {
-        sqlx::query(r#"
-            create table if not exists forks (
-                name text primary key,
-                checkpoint_id text not null,
-                created_at text not null
-            )
-        "#)
-        .execute(pool)
-        .await?;
+    if !needs_branch.is_empty() {
+        // All pre-existing checkpoints belong to 'main' — branches didn't exist before.
+        sqlx::query("update checkpoints set branch_name = 'main' where branch_name is null")
+            .execute(pool)
+            .await?;
     }
 
     Ok(())
@@ -2157,9 +2134,12 @@ pub async fn bootstrap_head_if_missing(store: &Store) -> Result<()> {
                 if let Some(cp_id) = cp_id {
                     if let Ok(uuid) = Uuid::parse_str(&cp_id) {
                         store.write_head(uuid)?;
+                        upsert_main_branch(&store.pool, uuid).await?;
                         return Ok(());
                     }
                 }
+            } else {
+                upsert_main_branch(&store.pool, id).await?;
             }
         }
         return Ok(());
@@ -2172,7 +2152,23 @@ pub async fn bootstrap_head_if_missing(store: &Store) -> Result<()> {
     if let Some(id) = latest {
         let uuid = parse_uuid(id)?;
         store.write_head(uuid)?;
+        upsert_main_branch(&store.pool, uuid).await?;
     }
+    Ok(())
+}
+
+async fn upsert_main_branch(pool: &SqlitePool, head_id: Uuid) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"insert into branches (name, head_checkpoint_id, created_at, updated_at)
+           values ('main', ?1, ?2, ?2)
+           on conflict(name) do update set head_checkpoint_id = excluded.head_checkpoint_id,
+                                           updated_at = excluded.updated_at"#,
+    )
+    .bind(head_id.to_string())
+    .bind(&now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

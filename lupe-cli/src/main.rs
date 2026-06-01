@@ -57,21 +57,21 @@ enum Command {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
-    #[command(about = "List checkpoints on the main chain. Use --all to include dead branches.")]
+    #[command(about = "List checkpoints. Defaults to main branch. Use --all to include all branches.")]
     History {
         #[arg(long)]
         all: bool,
         #[arg(long, help = "Include private checkpoints (hidden by default)")]
         show_private: bool,
     },
-    #[command(about = "List checkpoints showing only the user prompt for each. Useful to quickly scan what was worked on.")]
+    #[command(about = "List checkpoints showing only the user prompt. Defaults to main branch. Use --all for all branches.")]
     Prompts {
         #[arg(long)]
         all: bool,
         #[arg(long)]
         show_private: bool,
     },
-    #[command(about = "Visual tree of checkpoints. Use --all to show dead branches (forked work).")]
+    #[command(about = "Visual tree of checkpoints. Defaults to main branch. Use --all to show all branches.")]
     Graph {
         #[arg(long)]
         no_color: bool,
@@ -89,7 +89,7 @@ enum Command {
         from: Option<Uuid>,
         to: Option<Uuid>,
     },
-    #[command(about = "Restore workspace files to a specific checkpoint state. Also accepts a fork name.")]
+    #[command(about = "Restore workspace files to a specific checkpoint state. Also accepts a branch name.")]
     Restore {
         checkpoint: String,
         #[arg(long, default_value = ".")]
@@ -139,12 +139,12 @@ enum Command {
     Title {
         title: String,
     },
-    #[command(about = "Create a named fork (branch point) at the current HEAD checkpoint. Use before risky or parallel work.")]
-    Fork {
+    #[command(about = "Create a named branch at the current HEAD checkpoint. Use before risky or parallel work.")]
+    Branch {
         name: String,
     },
-    #[command(about = "List all forks and the checkpoint they point to.")]
-    Forks,
+    #[command(about = "List all branches and their head checkpoints.")]
+    Branches,
     #[command(about = "Manage isolated workspaces for parallel agent work.")]
     Workspace {
         #[command(subcommand)]
@@ -175,7 +175,7 @@ enum Command {
 #[derive(Subcommand)]
 enum WorkspaceAction {
     New {
-        fork: String,
+        branch: String,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
@@ -329,9 +329,6 @@ async fn main() -> Result<()> {
             }
             let colors = Colors::new(!no_color);
             let head_checkpoint = store.read_head();
-            let main_chain_ids = store.main_chain_checkpoint_ids().await?;
-            let main_chain_set: std::collections::HashSet<Uuid> =
-                main_chain_ids.iter().copied().collect();
 
             let checkpoints = store.list_checkpoints(all, show_private).await?;
             if checkpoints.is_empty() {
@@ -339,27 +336,25 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let all_checkpoints_for_forks = store.list_checkpoints(true, show_private).await?;
-            let mut forks_from: std::collections::HashMap<Uuid, Vec<&lupe_core::CheckpointView>> =
+            // Build map: parent_id → off-main-branch children (for --all display)
+            let mut branch_children: std::collections::HashMap<Uuid, Vec<lupe_core::CheckpointView>> =
                 std::collections::HashMap::new();
-            let dead_checkpoints: Vec<lupe_core::CheckpointView> = all_checkpoints_for_forks
-                .into_iter()
-                .filter(|c| !main_chain_set.contains(&c.id))
-                .collect();
-            for c in &dead_checkpoints {
-                if let Some(pcid) = c.parent_checkpoint_id {
-                    forks_from.entry(pcid).or_default().push(c);
+            if all {
+                let all_checkpoints = store.list_checkpoints(true, show_private).await?;
+                for c in all_checkpoints {
+                    if c.branch_name != "main" {
+                        if let Some(pcid) = c.parent_checkpoint_id {
+                            branch_children.entry(pcid).or_default().push(c);
+                        }
+                    }
                 }
             }
-
-            let head_checkpoint_id = main_chain_ids.first().copied();
 
             for (index, checkpoint) in checkpoints.iter().rev().enumerate() {
                 if index > 0 {
                     println!("{}", colors.dim("│"));
                 }
-                let is_head =
-                    head_checkpoint.is_some() && Some(checkpoint.id) == head_checkpoint_id;
+                let is_head = head_checkpoint == Some(checkpoint.id);
                 let head_marker = if is_head { " [HEAD]" } else { "" };
                 let (cp_label, title_display, pipe, prompt_label, checkpoint_sym) =
                     if checkpoint.private {
@@ -400,12 +395,7 @@ async fn main() -> Result<()> {
                 } else {
                     one_line(checkpoint.prompt.as_deref().unwrap_or(""))
                 };
-                println!(
-                    "{} {} {}",
-                    pipe,
-                    prompt_label,
-                    prompt_display
-                );
+                println!("{} {} {}", pipe, prompt_label, prompt_display);
                 if !checkpoint.private || show_private {
                     if let Some(agent) = &checkpoint.agent {
                         let session_suffix = checkpoint.session_id.as_deref()
@@ -431,32 +421,31 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let dead_children = forks_from
-                    .get(&checkpoint.id)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                for (di, dead) in dead_children.iter().enumerate() {
-                    let is_last_dead = di + 1 == dead_children.len();
-                    let pipe = if is_last_dead { " " } else { "│" };
-                    println!("{}", colors.dim(&format!("{pipe}  │")));
-                    println!(
-                        "{}",
-                        colors.dead(&format!(
-                            "{pipe}  ╰─ ◆ dead branch: {} ({}) {} files={} root={}",
-                            short_id(dead.id),
-                            dead.id,
-                            dead.title,
-                            dead.file_count,
-                            &dead.root_hash[..12],
-                        ))
-                    );
-                    println!(
-                        "{}",
-                        colors.dead(&format!(
-                            "{pipe}        prompt: {}",
-                            one_line(dead.prompt.as_deref().unwrap_or(""))
-                        ))
-                    );
+                if let Some(children) = branch_children.get(&checkpoint.id) {
+                    for (i, child) in children.iter().enumerate() {
+                        let is_last = i + 1 == children.len();
+                        let branch_pipe = if is_last { " " } else { "│" };
+                        println!("{}", colors.dim(&format!("{branch_pipe}  │")));
+                        println!(
+                            "{}",
+                            colors.branch(&format!(
+                                "{branch_pipe}  ╰─ ◆ branch: {} {} ({}) {} files={} root={}",
+                                child.branch_name,
+                                short_id(child.id),
+                                child.id,
+                                child.title,
+                                child.file_count,
+                                &child.root_hash[..12],
+                            ))
+                        );
+                        println!(
+                            "{}",
+                            colors.branch(&format!(
+                                "{branch_pipe}        prompt: {}",
+                                one_line(child.prompt.as_deref().unwrap_or(""))
+                            ))
+                        );
+                    }
                 }
             }
         }
@@ -473,7 +462,7 @@ async fn main() -> Result<()> {
             let workspace = absolutize(workspace)?;
             let checkpoint_id = match Uuid::parse_str(&checkpoint) {
                 Ok(id) => id,
-                Err(_) => store.resolve_fork_name(&checkpoint).await?,
+                Err(_) => store.resolve_branch_name(&checkpoint).await?,
             };
             let cp = store.restore_checkpoint(checkpoint_id, &workspace).await?;
             println!(
@@ -574,40 +563,40 @@ async fn main() -> Result<()> {
             let checkpoint_id = store.set_title(title.clone()).await?;
             println!("title updated {} -> {}", short_id(checkpoint_id), title);
         }
-        Command::Fork { name } => {
-            let fork = store.create_fork(name).await?;
-            println!("fork {} -> checkpoint {}", fork.name, short_id(fork.checkpoint_id));
+        Command::Branch { name } => {
+            let branch = store.create_branch(name).await?;
+            println!("branch {} -> checkpoint {}", branch.name, short_id(branch.head_checkpoint_id));
         }
-        Command::Forks => {
-            let forks = store.list_forks().await?;
-            if forks.is_empty() {
-                println!("no forks — run: lupe fork <name>");
+        Command::Branches => {
+            let branches = store.list_branches().await?;
+            if branches.is_empty() {
+                println!("no branches — run: lupe branch <name>");
             } else {
-                for fork in forks {
+                for branch in branches {
                     println!(
-                        "{}  checkpoint={}  {}",
-                        fork.name,
-                        short_id(fork.checkpoint_id),
-                        friendly_time(fork.created_at),
+                        "{}  head={}  {}",
+                        branch.name,
+                        short_id(branch.head_checkpoint_id),
+                        friendly_time(branch.updated_at),
                     );
                 }
             }
         }
         Command::Workspace { action } => match action {
-            WorkspaceAction::New { fork, workspace } => {
+            WorkspaceAction::New { branch, workspace } => {
                 let workspace = absolutize(workspace)?;
-                let ws_dir = store.create_workspace(&fork, &workspace).await?;
-                println!("workspace '{fork}' created");
+                let ws_dir = store.create_workspace(&branch, &workspace).await?;
+                println!("workspace '{branch}' created");
                 println!("path  {}", ws_dir.display());
                 println!("cd into it and run your app independently");
             }
             WorkspaceAction::List => {
                 let workspaces = store.list_workspaces()?;
                 if workspaces.is_empty() {
-                    println!("no workspaces — run: lupe workspace new <fork-name>");
+                    println!("no workspaces — run: lupe workspace new <branch-name>");
                 } else {
                     for ws in workspaces {
-                        println!("{}  fork={}  {}", ws.name, ws.fork, ws.path.display());
+                        println!("{}  branch={}  {}", ws.name, ws.branch, ws.path.display());
                     }
                 }
             }

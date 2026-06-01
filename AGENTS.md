@@ -52,23 +52,23 @@ Detect stack: `package.json` → Node, `Cargo.toml` → Rust, `requirements.txt`
 with generic defaults, but create it early with stack-specific entries
 (e.g. `dist`, `.next`, `__pycache__`, `build`).
 
-## Forks — Named Branch Points — MANDATORY
+## Branches — MANDATORY
 
-**Before modifying any file, you MUST run `lupe fork "<task-name>"` first. No exceptions.**
+**Before modifying any file, you MUST run `lupe branch "<task-name>"` first. No exceptions.**
 
 ```bash
-lupe fork "fix-login-bug"         # ALWAYS do this before touching files
-lupe forks                        # list all named forks
+lupe branch "fix-login-bug"       # ALWAYS do this before touching files
+lupe branches                     # list all branches
 lupe restore fix-login-bug        # restore by name
 ```
 
 Do NOT skip this step even for "small" changes.
 
 Trying an alternative approach:
-1. `lupe fork "<task-name>"` — FIRST, before any file changes
+1. `lupe branch "<task-name>"` — FIRST, before any file changes
 2. Make the change
 3. `lupe save "what changed"`
-4. If it works: keep going. If not: `lupe restore <fork-name>` → dead branch in graph.
+4. If it works: keep going. If not: `lupe restore <branch-name>` to roll back.
 
 ## Workflow
 
@@ -88,21 +88,20 @@ Save after each coherent functional unit, before risky changes, after tests pass
 and before restore/destructive operations.
 
 **Never revert work by editing files manually. Always use `lupe restore`.**
-This preserves dropped work as a dead branch visible in `lupe graph`.
 
 Useful commands:
 
 ```bash
 lupe history
 lupe prompts
-lupe forks
+lupe branches
 lupe graph
 lupe search "<topic>"
 lupe diff
 lupe diff <checkpoint-uuid>
 lupe diff <from-uuid> <to-uuid>
-lupe restore <checkpoint-uuid-or-fork-name>
-lupe fork "name"
+lupe restore <checkpoint-uuid-or-branch-name>
+lupe branch "name"
 lupe author
 lupe author --name "Name" --email "email"
 ```

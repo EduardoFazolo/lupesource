@@ -18,19 +18,20 @@ Built-in triggers — ALWAYS mark private without needing `.lupeprivate`:
 ## Core Workflow
 
 ```bash
-lupe docs                          # read this first — full reference
-lupe fork "<task-name>"            # ALWAYS before touching files
-lupe prompt "<full user prompt>"   # start of every task
-lupe save "<description>"          # after each unit of work
-lupe restore <fork-name>           # undo — never edit files manually to revert
+lupe docs                             # read this first — full reference
+lupe branch "<task-name>"             # ALWAYS before touching files
+lupe prompt "<full user prompt>"      # start of every task
+lupe save "<description>"             # after each unit of work
+lupe restore <branch-name>            # undo — never edit files manually to revert
 ```
 
 ## Inspection & Merge
 
 ```bash
-lupe graph --all                   # full history including dead branches
-lupe diff <from> <to>              # what changed between saves
-lupe files <checkpoint-id>         # list files in a checkpoint
-lupe cat <file> <checkpoint-id>    # read a file as it existed in a checkpoint
-lupe search "<query>"              # full-text search across history
+lupe graph --all                      # full history across all branches
+lupe branches                         # list all branches
+lupe diff <from> <to>                 # what changed between checkpoints
+lupe files <checkpoint-id>            # list files in a checkpoint
+lupe cat <file> <checkpoint-id>       # read a file as it existed in a checkpoint
+lupe search "<query>"                 # full-text search across history
 ```

@@ -7,6 +7,10 @@ import { Detail } from './Detail';
 const MOCK: GraphData = {
   project_name: 'demo',
   head_checkpoint_id: 'cp-3',
+  branches: [
+    { name: 'main', head_checkpoint_id: 'cp-3', created_at: new Date(Date.now() - 3600000 * 6).toISOString(), updated_at: new Date(Date.now() - 3600000 * 2).toISOString() },
+    { name: 'try-postgres', head_checkpoint_id: 'cp-branch', created_at: new Date(Date.now() - 3600000 * 4.5).toISOString(), updated_at: new Date(Date.now() - 3600000 * 4.5).toISOString() },
+  ],
   checkpoints: [
     {
       id: 'cp-1', title: 'Initial setup',
@@ -14,7 +18,7 @@ const MOCK: GraphData = {
       response: null, agent: 'claude-opus-4', session_id: null,
       parent_checkpoint_id: null, root_hash: 'abc123', file_count: 4,
       created_at: new Date(Date.now() - 3600000 * 6).toISOString(),
-      private: false, is_head: false, is_main_chain: true,
+      private: false, is_head: false, branch_name: 'main',
       diff_added: 4, diff_modified: 0, diff_removed: 0,
     },
     {
@@ -24,16 +28,16 @@ const MOCK: GraphData = {
       agent: 'claude-opus-4', session_id: null,
       parent_checkpoint_id: 'cp-1', root_hash: 'ghi789', file_count: 6,
       created_at: new Date(Date.now() - 3600000 * 4).toISOString(),
-      private: false, is_head: false, is_main_chain: true,
+      private: false, is_head: false, branch_name: 'main',
       diff_added: 1, diff_modified: 2, diff_removed: 0,
     },
     {
-      id: 'cp-dead', title: 'Try postgres instead',
+      id: 'cp-branch', title: 'Try postgres instead',
       prompt: 'Switch to postgres backend for scalability',
       response: null, agent: 'claude-sonnet-4', session_id: null,
       parent_checkpoint_id: 'cp-1', root_hash: 'xyz999', file_count: 5,
       created_at: new Date(Date.now() - 3600000 * 4.5).toISOString(),
-      private: false, is_head: false, is_main_chain: false,
+      private: false, is_head: false, branch_name: 'try-postgres',
       diff_added: 1, diff_modified: 1, diff_removed: 0,
     },
     {
@@ -43,7 +47,7 @@ const MOCK: GraphData = {
       agent: 'claude-opus-4', session_id: null,
       parent_checkpoint_id: 'cp-2', root_hash: 'mno345', file_count: 8,
       created_at: new Date(Date.now() - 3600000 * 2).toISOString(),
-      private: false, is_head: true, is_main_chain: true,
+      private: false, is_head: true, branch_name: 'main',
       diff_added: 3, diff_modified: 1, diff_removed: 0,
     },
   ],
@@ -118,9 +122,9 @@ export default function App() {
         <span style={{ fontSize: 11, color: '#ccc8e0' }}>/</span>
         <span style={{ fontSize: 11, color: '#5a5678' }}>{data.project_name}</span>
         <span style={{ fontSize: 10, color: '#b0aac8', marginLeft: 'auto' }}>
-          {data.checkpoints.filter(c => c.is_main_chain).length} checkpoints
-          {data.checkpoints.filter(c => !c.is_main_chain).length > 0 &&
-            ` · ${data.checkpoints.filter(c => !c.is_main_chain).length} dead`}
+          {data.checkpoints.length} checkpoints
+          {data.branches.length > 0 &&
+            ` · ${data.branches.length} branch${data.branches.length !== 1 ? 'es' : ''}`}
         </span>
       </div>
 

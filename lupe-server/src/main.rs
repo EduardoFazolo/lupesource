@@ -48,11 +48,11 @@ struct AppState {
 
 // ── HEAD watcher ──────────────────────────────────────────────────────────────
 
-async fn watch_head(home: PathBuf, tx: broadcast::Sender<String>) {
-    let head_path = home.join("HEAD");
+async fn watch_tick(home: PathBuf, tx: broadcast::Sender<String>) {
+    let tick_path = home.join("tick");
     let mut last = String::new();
     loop {
-        if let Ok(content) = tokio::fs::read_to_string(&head_path).await {
+        if let Ok(content) = tokio::fs::read_to_string(&tick_path).await {
             let content = content.trim().to_string();
             if !content.is_empty() && content != last {
                 last = content.clone();
@@ -66,7 +66,7 @@ async fn watch_head(home: PathBuf, tx: broadcast::Sender<String>) {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn handle_graph(State(state): State<Arc<AppState>>) -> Response<Body> {
-    match state.store.build_web_graph_data(false, false).await {
+    match state.store.build_web_graph_data(true, false).await {
         Ok(data) => Json(data).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e}")).into_response(),
     }
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
 
     let (tx, _) = broadcast::channel::<String>(32);
     let home = store.home.clone();
-    tokio::spawn(watch_head(home, tx.clone()));
+    tokio::spawn(watch_tick(home, tx.clone()));
 
     let state = Arc::new(AppState { store, tx });
 
