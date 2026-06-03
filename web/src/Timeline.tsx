@@ -91,17 +91,18 @@ function buildRows(checkpoints: CheckpointData[]): Row[] {
 
     for (const entry of branchEntries) {
       const nodes = chain(entry); // oldest → newest
-      // Push oldest first; after rows.reverse(), oldest ends up at TOP (closest to newer main above),
-      // newest at BOTTOM (closest to parent main below, which shows the arm).
+      // After rows.reverse(): newest ends up at TOP, oldest at BOTTOM (adjacent to parent main).
+      // hasAbove: false only for the TOP node (newest) — nothing above it in the branch column.
+      // hasBelow: false only for the BOTTOM node (oldest) — parent arm closes that gap.
       for (let ni = 0; ni < nodes.length; ni++) {
-        const isOldest = ni === 0;               // will be at TOP after reversal — no spine above
-        const isNewest = ni === nodes.length - 1; // will be at BOTTOM after reversal — no spine below (parent arm closes it)
+        const isNewest = ni === nodes.length - 1; // → TOP after reversal
+        const isOldest = ni === 0;                // → BOTTOM after reversal
         rows.push({
           kind: 'branch',
           cp: nodes[ni],
           branchName: entry.branch_name,
-          hasAbove: !isOldest,  // all except oldest have spine above
-          hasBelow: !isNewest,  // all except newest have spine below (parent arm handles the last segment)
+          hasAbove: !isNewest,  // all except the TOP (newest) node have spine above
+          hasBelow: !isOldest,  // all except the BOTTOM (oldest) node have spine below
         });
       }
     }
