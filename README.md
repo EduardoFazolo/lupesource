@@ -1,4 +1,4 @@
-# LupeHub
+# LupeSource
 
 Agent-native source control.
 
