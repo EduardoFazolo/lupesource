@@ -18,20 +18,15 @@ const C = {
   textMuted: '#b0aac8',
 };
 
-// ── Branch coloring ───────────────────────────────────────────────────────────
-
 function branchHue(name: string): number {
-  if (name === 'main') return 255; // fixed purple for main
+  if (name === 'main') return 255;
   let h = 0;
   for (let i = 0; i < name.length; i++) h = Math.imul(h * 31 + name.charCodeAt(i), 1) | 0;
-  // avoid the main purple range (230-270) so branches don't clash
   const raw = Math.abs(h) % 300;
-  return raw < 40 ? raw + 300 : raw; // shift hues near purple
+  return raw < 40 ? raw + 300 : raw;
 }
 function branchColor(name: string)    { return `hsl(${branchHue(name)}, 52%, 58%)`; }
 function branchColorDim(name: string) { return `hsl(${branchHue(name)}, 40%, 72%)`; }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function timeAgo(iso: string) {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -42,67 +37,203 @@ function timeAgo(iso: string) {
   if (h < 24) return `${h}h`;
   return `${Math.floor(h / 24)}d`;
 }
-function shortId(id: string)             { return id.replace(/-/g, '').slice(0, 7); }
+function shortId(id: string) { return id.replace(/-/g, '').slice(0, 7); }
 function oneLinePrompt(p: string | null) {
   if (!p) return '';
   return p.replace(/\[Image:[^\]]*\]/g, '[img]').split('\n')[0].slice(0, 72);
 }
 
-// ── Lane computation ──────────────────────────────────────────────────────────
+// ── Tree row model ────────────────────────────────────────────────────────────
 
-const MAIN_X  = 14;  // x-center of main lane dot
-const MAIN_W  = 28;  // main lane column width
-const LANE_W  = 10;  // px per branch lane
-const DOT_Y   = 14;  // y-center of dot from top of row
-const DOT_R   =  5;  // dot half-size
+type Row =
+  | { kind: 'main';   cp: CheckpointData; hasAbove: boolean; hasBelow: boolean;
+      // If this main checkpoint is the parent of a branch chain above it:
+      branchArmColor: string | null; }
+  | { kind: 'branch'; cp: CheckpointData; branchName: string;
+      hasAbove: boolean;  // branch spine from top of row to dot
+      hasBelow: boolean;  // branch spine from dot to bottom of row
+    };
 
-interface BranchLane {
-  cp: CheckpointData;
-  rowIdx: number;
-  parentIdx: number;
-  lane: number;   // 1-based
-  color: string;
-}
+function buildRows(checkpoints: CheckpointData[]): Row[] {
+  const main = checkpoints
+    .filter(c => c.branch_name === 'main')
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
 
-function computeLanes(checkpoints: CheckpointData[]): {
-  rows: CheckpointData[];
-  branchLanes: BranchLane[];
-  laneOf: Map<string, number>;
-  gutterW: number;
-} {
-  const rows = [...checkpoints].sort(
-    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-  );
-  const idToIdx = new Map(rows.map((cp, i) => [cp.id, i]));
-
-  // Collect all distinct non-main branch names, sorted for stable lane assignment
-  const branchNames = Array.from(
-    new Set(rows.filter(cp => cp.branch_name !== 'main').map(cp => cp.branch_name))
-  ).sort();
-  const branchToLane = new Map(branchNames.map((name, i) => [name, i + 1]));
-
-  const branchLanes: BranchLane[] = [];
-  const laneOf = new Map<string, number>();
-
-  for (let i = 0; i < rows.length; i++) {
-    const cp = rows[i];
-    if (cp.branch_name === 'main') continue;
-
-    const lane = branchToLane.get(cp.branch_name) ?? 1;
-    const parentIdx = cp.parent_checkpoint_id
-      ? (idToIdx.get(cp.parent_checkpoint_id) ?? rows.length - 1)
-      : rows.length - 1;
-
-    laneOf.set(cp.id, lane);
-    branchLanes.push({ cp, rowIdx: i, parentIdx, lane, color: branchColor(cp.branch_name) });
+  const byParent = new Map<string, CheckpointData[]>();
+  for (const cp of checkpoints) {
+    if (cp.parent_checkpoint_id) {
+      const list = byParent.get(cp.parent_checkpoint_id) ?? [];
+      list.push(cp);
+      byParent.set(cp.parent_checkpoint_id, list);
+    }
   }
 
-  const maxLane = branchLanes.reduce((m, f) => Math.max(m, f.lane), 0);
-  const gutterW = MAIN_W + maxLane * LANE_W;
-  return { rows, branchLanes, laneOf, gutterW };
+  function chain(entry: CheckpointData): CheckpointData[] {
+    const result = [entry];
+    let cur = entry;
+    for (;;) {
+      const next = (byParent.get(cur.id) ?? []).find(c => c.branch_name === entry.branch_name);
+      if (!next) break;
+      result.push(next);
+      cur = next;
+    }
+    return result;
+  }
+
+  const rows: Row[] = [];
+  for (let mi = 0; mi < main.length; mi++) {
+    const mainCp = main[mi];
+    const branchEntries = (byParent.get(mainCp.id) ?? []).filter(c => c.branch_name !== 'main');
+    const hasBelow = mi < main.length - 1 || branchEntries.length > 0;
+    // branchArmColor: if this row is the parent of a branch, show the arm coming from its dot.
+    const branchArmColor = branchEntries.length > 0 ? branchColor(branchEntries[0].branch_name) : null;
+    rows.push({ kind: 'main', cp: mainCp, hasAbove: mi > 0, hasBelow, branchArmColor });
+
+    for (const entry of branchEntries) {
+      const nodes = chain(entry); // oldest → newest
+      // Push oldest first; after rows.reverse(), oldest ends up at TOP (closest to newer main above),
+      // newest at BOTTOM (closest to parent main below, which shows the arm).
+      for (let ni = 0; ni < nodes.length; ni++) {
+        const isOldest = ni === 0;               // will be at TOP after reversal — no spine above
+        const isNewest = ni === nodes.length - 1; // will be at BOTTOM after reversal — no spine below (parent arm closes it)
+        rows.push({
+          kind: 'branch',
+          cp: nodes[ni],
+          branchName: entry.branch_name,
+          hasAbove: !isOldest,  // all except oldest have spine above
+          hasBelow: !isNewest,  // all except newest have spine below (parent arm handles the last segment)
+        });
+      }
+    }
+  }
+
+  return rows.reverse();
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// ── Checkpoint card ───────────────────────────────────────────────────────────
+
+interface CardProps {
+  cp: CheckpointData;
+  selected: boolean;
+  onSelect: (id: string) => void;
+  headRef: React.RefObject<HTMLDivElement | null>;
+  color: string;
+  gutter: React.ReactNode;
+}
+
+function Card({ cp, selected, onSelect, headRef, color, gutter }: CardProps) {
+  return (
+    <div
+      ref={cp.is_head ? headRef : undefined}
+      onClick={() => onSelect(cp.id)}
+      style={{
+        display: 'flex',
+        alignItems: 'stretch',
+        cursor: 'pointer',
+        background: selected ? C.rowSelected : 'transparent',
+        borderLeft: `3px solid ${selected ? C.rowSelectedBorder : color}`,
+        transition: 'background 0.1s',
+      }}
+      onMouseEnter={e => { if (!selected) (e.currentTarget as HTMLDivElement).style.background = C.rowHover; }}
+      onMouseLeave={e => { if (!selected) (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
+    >
+      {gutter}
+
+      {/* Content */}
+      <div style={{ flex: 1, minWidth: 0, padding: '9px 12px 7px 4px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
+          <span style={{ fontSize: 10, color: C.textMuted }}>{shortId(cp.id)}</span>
+
+          {cp.branch_name !== 'main' && (
+            <span style={{
+              fontSize: 8, fontWeight: 600, color: '#fff',
+              background: color, borderRadius: 3,
+              padding: '0 4px', lineHeight: '14px',
+              maxWidth: 80, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              {cp.branch_name}
+            </span>
+          )}
+
+          {cp.is_head && (
+            <span style={{
+              fontSize: 9, fontWeight: 700,
+              color: C.headText, background: C.headBg,
+              border: `1px solid ${C.headBorder}`,
+              borderRadius: 3, padding: '0 4px', lineHeight: '14px',
+            }}>HEAD</span>
+          )}
+
+          <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 3 }}>
+            {cp.session_id && (
+              <span
+                onClick={e => { e.stopPropagation(); navigator.clipboard.writeText(cp.session_id!); }}
+                title="click to copy"
+                style={{
+                  fontSize: 7, color: branchColorDim(cp.branch_name),
+                  fontFamily: 'monospace', cursor: 'copy',
+                  overflow: 'hidden', maxWidth: 80, textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}
+              >
+                {cp.session_id}
+              </span>
+            )}
+            <span style={{ fontSize: 10, color: C.textMuted, flexShrink: 0 }}>
+              {timeAgo(cp.created_at)}
+            </span>
+          </span>
+        </div>
+
+        <div style={{
+          fontSize: 12, fontWeight: 600, lineHeight: 1.35,
+          color: selected ? '#2a2060' : C.text,
+          wordBreak: 'break-word',
+          marginBottom: cp.prompt ? 2 : 0,
+        }}>
+          {cp.title || '(untitled)'}
+        </div>
+
+        {cp.prompt && (
+          <div style={{
+            fontSize: 10, color: C.textSub,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            marginBottom: 4,
+          }}>
+            {oneLinePrompt(cp.prompt)}
+          </div>
+        )}
+
+        {(cp.diff_added + cp.diff_modified + cp.diff_removed) > 0 && (
+          <div style={{ display: 'flex', gap: 6, fontSize: 10 }}>
+            {cp.diff_added    > 0 && <span style={{ color: '#1a7f37', fontWeight: 600 }}>+{cp.diff_added}</span>}
+            {cp.diff_modified > 0 && <span style={{ color: '#8a6500', fontWeight: 600 }}>~{cp.diff_modified}</span>}
+            {cp.diff_removed  > 0 && <span style={{ color: '#cf222e', fontWeight: 600 }}>−{cp.diff_removed}</span>}
+            <span style={{ color: C.textMuted }}>files</span>
+          </div>
+        )}
+      </div>
+
+      {/* Branch color corner */}
+      <div style={{
+        position: 'absolute', bottom: 0, right: 0,
+        width: 0, height: 0,
+        borderLeft: '14px solid transparent',
+        borderBottom: `14px solid ${color}`,
+        opacity: 0.35, pointerEvents: 'none',
+      }} />
+    </div>
+  );
+}
+
+// ── Gutter constants ──────────────────────────────────────────────────────────
+
+const MAIN_X   = 14;   // center of main spine
+const DOT_Y    = 14;   // dot center y from row top
+const DOT_R    =  5;   // dot radius
+const BRANCH_X = 38;   // x center of branch spine
+const INDENT   = 52;   // total gutter width
+
+// ── Timeline ──────────────────────────────────────────────────────────────────
 
 interface Props {
   checkpoints: CheckpointData[];
@@ -117,12 +248,11 @@ export function Timeline({ checkpoints, selectedId, onSelect }: Props) {
     headRef.current?.scrollIntoView({ block: 'center', behavior: 'instant' });
   }, []);
 
-  const { rows, branchLanes, laneOf, gutterW } = computeLanes(checkpoints);
-  const isMain = (cp: CheckpointData) => cp.branch_name === 'main';
+  const rows = buildRows(checkpoints);
 
   return (
     <div style={{
-      width: 310, minWidth: 310,
+      width: 320, minWidth: 320,
       height: '100%',
       borderRight: '1px solid #e4e0f0',
       overflowY: 'auto',
@@ -130,194 +260,63 @@ export function Timeline({ checkpoints, selectedId, onSelect }: Props) {
       display: 'flex',
       flexDirection: 'column',
     }}>
-      {rows.map((cp, R) => {
-        const isSelected  = selectedId === cp.id;
-        const onMain      = isMain(cp);
-        const myLane      = onMain ? 0 : (laneOf.get(cp.id) ?? 1);
-        const color       = branchColor(cp.branch_name);
+      {rows.map((row) => {
+        const isSelected = selectedId === row.cp.id;
 
-        // Branch lane lines passing through this row
-        const passing    = branchLanes.filter(f => f.rowIdx <= R && R < f.parentIdx);
-        // Branch lanes whose parent is at this row → draw connector
-        const connectors = branchLanes.filter(f => f.parentIdx === R);
-
-        const mainAbove = onMain && R > 0 && rows.slice(0, R).some(r => isMain(r));
-        const mainBelow = onMain && rows.slice(R + 1).some(r => isMain(r));
-
-        return (
-          <div
-            key={cp.id}
-            ref={cp.is_head ? headRef : undefined}
-            onClick={() => onSelect(cp.id)}
-            style={{
-              display: 'flex',
-              alignItems: 'stretch',
-              cursor: 'pointer',
-              position: 'relative',
-              background: isSelected ? C.rowSelected : 'transparent',
-              borderLeft: `3px solid ${isSelected ? C.rowSelectedBorder : color}`,
-              transition: 'background 0.1s',
-            }}
-            onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLDivElement).style.background = C.rowHover; }}
-            onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
-          >
-            {/* ── Gutter ── */}
-            <div style={{ width: gutterW, minWidth: gutterW, flexShrink: 0, position: 'relative', alignSelf: 'stretch' }}>
-
-              {/* Main spine above/below dot */}
-              {mainAbove && (
-                <div style={{ position: 'absolute', left: MAIN_X - 1, top: 0, height: DOT_Y - DOT_R, width: 2, background: C.line }} />
+        if (row.kind === 'main') {
+          const arm = row.branchArmColor;
+          const gutter = (
+            <div style={{ width: INDENT, minWidth: INDENT, flexShrink: 0, position: 'relative', alignSelf: 'stretch' }}>
+              {/* main spine above dot */}
+              {row.hasAbove && <div style={{ position: 'absolute', left: MAIN_X - 1, top: 0, height: DOT_Y - DOT_R, width: 2, background: C.line }} />}
+              {/* main spine below dot */}
+              {row.hasBelow && <div style={{ position: 'absolute', left: MAIN_X - 1, top: DOT_Y + DOT_R, bottom: 0, width: 2, background: C.line }} />}
+              {/* branch arm: horizontal from main dot → branch column, + vertical up to row top */}
+              {arm && (
+                <>
+                  <div style={{ position: 'absolute', top: DOT_Y - 1, left: MAIN_X + DOT_R, width: BRANCH_X - MAIN_X - DOT_R, height: 2, background: arm, opacity: 0.8 }} />
+                  <div style={{ position: 'absolute', left: BRANCH_X - 1, top: 0, height: DOT_Y, width: 2, background: arm, opacity: 0.6 }} />
+                </>
               )}
-              {mainBelow && (
-                <div style={{ position: 'absolute', left: MAIN_X - 1, top: DOT_Y + DOT_R, bottom: 0, width: 2, background: C.line }} />
-              )}
-
-              {/* Main chain diamond */}
-              {onMain && (
-                <div style={{
-                  position: 'absolute',
-                  left: MAIN_X - DOT_R, top: DOT_Y - DOT_R,
-                  width: DOT_R * 2, height: DOT_R * 2,
-                  background: cp.is_head ? C.dotHead : C.dot,
-                  transform: 'rotate(45deg)', borderRadius: 2,
-                  boxShadow: cp.is_head ? `0 0 0 3px ${C.headBg}, 0 0 0 4px ${C.dotHead}` : 'none',
-                  zIndex: 3,
-                }} />
-              )}
-
-              {/* Branch lane vertical lines passing through */}
-              {passing.map(f => {
-                const x = MAIN_W + (f.lane - 1) * LANE_W + Math.floor(LANE_W / 2) - 1;
-                const isAtBranch = R === f.rowIdx;
-                return (
-                  <div key={f.cp.id} style={{
-                    position: 'absolute', left: x,
-                    top: isAtBranch ? DOT_Y + DOT_R : 0,
-                    bottom: 0,
-                    width: 2, background: f.color, opacity: 0.7, zIndex: 1,
-                  }} />
-                );
-              })}
-
-              {/* Horizontal connectors at parent rows */}
-              {connectors.map(f => {
-                const laneX = MAIN_W + (f.lane - 1) * LANE_W + Math.floor(LANE_W / 2);
-                return (
-                  <div key={`conn-${f.cp.id}`} style={{
-                    position: 'absolute', left: MAIN_X, top: DOT_Y - 1,
-                    width: laneX - MAIN_X, height: 2,
-                    background: f.color, opacity: 0.7, zIndex: 2,
-                  }} />
-                );
-              })}
-
-              {/* Branch dot */}
-              {!onMain && (
-                <div style={{
-                  position: 'absolute',
-                  left: MAIN_W + (myLane - 1) * LANE_W + Math.floor(LANE_W / 2) - 4,
-                  top: DOT_Y - 4,
-                  width: 8, height: 8,
-                  borderRadius: '50%',
-                  background: color,
-                  border: '2px solid white',
-                  zIndex: 3,
-                }} />
-              )}
-            </div>
-
-            {/* ── Content ── */}
-            <div style={{ flex: 1, minWidth: 0, padding: '10px 12px 8px 4px' }}>
-
-              {/* Meta row */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
-                <span style={{ fontSize: 10, color: C.textMuted }}>{shortId(cp.id)}</span>
-
-                {/* Branch pill — shown for non-main branches */}
-                {!onMain && (
-                  <span style={{
-                    fontSize: 8, fontWeight: 600,
-                    color: '#fff',
-                    background: color,
-                    borderRadius: 3, padding: '0 4px', lineHeight: '14px',
-                    maxWidth: 80, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }}>
-                    {cp.branch_name}
-                  </span>
-                )}
-
-                {cp.is_head && (
-                  <span style={{
-                    fontSize: 9, fontWeight: 700,
-                    color: C.headText, background: C.headBg,
-                    border: `1px solid ${C.headBorder}`,
-                    borderRadius: 3, padding: '0 4px', lineHeight: '14px',
-                  }}>HEAD</span>
-                )}
-
-                <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 3, minWidth: 0 }}>
-                  {cp.session_id && (
-                    <span
-                      onClick={e => { e.stopPropagation(); navigator.clipboard.writeText(cp.session_id!); }}
-                      title="click to copy"
-                      style={{
-                        fontSize: 7, color: branchColorDim(cp.branch_name),
-                        fontFamily: 'monospace', userSelect: 'text',
-                        cursor: 'copy', flexShrink: 0,
-                        overflow: 'hidden', maxWidth: 80,
-                        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {cp.session_id}
-                    </span>
-                  )}
-                  <span style={{ fontSize: 10, color: C.textMuted, flexShrink: 0 }}>
-                    {timeAgo(cp.created_at)}
-                  </span>
-                </span>
-              </div>
-
-              {/* Title */}
+              {/* diamond */}
               <div style={{
-                fontSize: 12, fontWeight: 600, lineHeight: 1.35,
-                color: isSelected ? '#2a2060' : C.text,
-                wordBreak: 'break-word',
-                marginBottom: cp.prompt ? 2 : 0,
-              }}>
-                {cp.title || '(untitled)'}
-              </div>
-
-              {/* Prompt preview */}
-              {cp.prompt && (
-                <div style={{
-                  fontSize: 10, color: C.textSub,
-                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  marginBottom: 4,
-                }}>
-                  {oneLinePrompt(cp.prompt)}
-                </div>
-              )}
-
-              {/* Diff stats — all branches */}
-              {(cp.diff_added + cp.diff_modified + cp.diff_removed) > 0 && (
-                <div style={{ display: 'flex', gap: 6, fontSize: 10 }}>
-                  {cp.diff_added    > 0 && <span style={{ color: '#1a7f37', fontWeight: 600 }}>+{cp.diff_added}</span>}
-                  {cp.diff_modified > 0 && <span style={{ color: '#8a6500', fontWeight: 600 }}>~{cp.diff_modified}</span>}
-                  {cp.diff_removed  > 0 && <span style={{ color: '#cf222e', fontWeight: 600 }}>−{cp.diff_removed}</span>}
-                  <span style={{ color: C.textMuted }}>files</span>
-                </div>
-              )}
+                position: 'absolute',
+                left: MAIN_X - DOT_R, top: DOT_Y - DOT_R,
+                width: DOT_R * 2, height: DOT_R * 2,
+                background: row.cp.is_head ? C.dotHead : C.dot,
+                transform: 'rotate(45deg)', borderRadius: 2,
+                boxShadow: row.cp.is_head ? `0 0 0 3px ${C.headBg}, 0 0 0 4px ${C.dotHead}` : 'none',
+                zIndex: 3,
+              }} />
             </div>
+          );
+          return (
+            <div key={row.cp.id} style={{ position: 'relative' }}>
+              <Card cp={row.cp} selected={isSelected} onSelect={onSelect} headRef={headRef} color={branchColor('main')} gutter={gutter} />
+            </div>
+          );
+        }
 
-            {/* Branch color triangle — bottom-right corner */}
+        // branch row
+        const bColor = branchColor(row.branchName);
+        const gutter = (
+          <div style={{ width: INDENT, minWidth: INDENT, flexShrink: 0, position: 'relative', alignSelf: 'stretch' }}>
+            {row.hasAbove && <div style={{ position: 'absolute', left: BRANCH_X - 1, top: 0, height: DOT_Y - DOT_R + 1, width: 2, background: bColor, opacity: 0.6 }} />}
+            {row.hasBelow && <div style={{ position: 'absolute', left: BRANCH_X - 1, top: DOT_Y + DOT_R - 1, bottom: 0, width: 2, background: bColor, opacity: 0.6 }} />}
+            {/* newest node: extend spine to bottom of row to meet parent arm */}
+            {!row.hasBelow && <div style={{ position: 'absolute', left: BRANCH_X - 1, top: DOT_Y + DOT_R - 1, bottom: 0, width: 2, background: bColor, opacity: 0.6 }} />}
             <div style={{
-              position: 'absolute', bottom: 0, right: 0,
-              width: 0, height: 0,
-              borderLeft: '14px solid transparent',
-              borderBottom: `14px solid ${color}`,
-              opacity: 0.45,
-              pointerEvents: 'none',
+              position: 'absolute',
+              left: BRANCH_X - DOT_R + 1, top: DOT_Y - DOT_R + 1,
+              width: (DOT_R - 1) * 2, height: (DOT_R - 1) * 2,
+              borderRadius: '50%', background: bColor,
+              border: '2px solid white', zIndex: 3,
             }} />
+          </div>
+        );
+        return (
+          <div key={row.cp.id} style={{ position: 'relative' }}>
+            <Card cp={row.cp} selected={isSelected} onSelect={onSelect} headRef={headRef} color={bColor} gutter={gutter} />
           </div>
         );
       })}

@@ -85,13 +85,12 @@ export default function App() {
     // Real-time updates via SSE — server pushes on every new checkpoint
     const es = new EventSource('/api/events');
     es.addEventListener('checkpoint', () => fetchGraph());
-    es.onerror = () => {
-      // SSE dropped — fall back to polling until reconnected
-      const t = setTimeout(() => fetchGraph(), 3000);
-      return () => clearTimeout(t);
-    };
+    es.onerror = () => fetchGraph();
 
-    return () => es.close();
+    // Heartbeat poll — catches anything SSE misses (reconnects, missed events)
+    const interval = setInterval(fetchGraph, 5000);
+
+    return () => { es.close(); clearInterval(interval); };
   }, []);
 
   const selected = useMemo<CheckpointData | null>(() => {
