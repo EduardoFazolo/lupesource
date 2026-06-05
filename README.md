@@ -98,24 +98,37 @@ lupe cat <file> <checkpoint>  # print a file as it existed in a checkpoint
 
 ## Setup
 
+Two steps: wire the stop hooks, then install the agent skills.
+
 ```bash
-lupe install                  # configure agent stop hooks
-lupe install-hooks            # only wire stop hooks (Claude Code, Codex, Cursor)
-lupe agent-install            # install Lupe setup skill into Codex, Claude, and Cursor
-lupe install-skill            # install Lupe usage skill into Codex, Claude, and Cursor
-lupe agent-install --agent codex
-lupe agent-install --agent claude
-lupe agent-install --agent cursor
-lupe install-skill --agent codex
-lupe install-skill --agent claude
-lupe install-skill --agent cursor
+lupe install                  # configure stop hooks (records LUPE_BIN path)
+lupe agent-install            # install the Lupe setup skill into Codex, Claude, Cursor
+lupe install-skill            # install the Lupe workflow skill into Codex, Claude, Cursor
 ```
 
 `lupe install` records the current `lupe` binary path in hook commands with
-`LUPE_BIN=...`, so hooks do not depend on a hardcoded user-specific path.
+`LUPE_BIN=...`, so hooks do not depend on a hardcoded user-specific path. Use
+`lupe install-hooks` to wire only the stop hooks without anything else.
 
-Lupe does not create or update `AGENTS.md`. Use `lupe agent-install` for
-agent-facing setup guidance and `lupe install-skill` for workflow instructions.
+Target a single agent with `--agent`:
+
+```bash
+lupe agent-install --agent codex     # also: --agent claude, --agent cursor
+lupe install-skill  --agent codex
+```
+
+### How agents learn Lupe
+
+Agents pick up Lupe through **skills**, not project files. `agent-install`
+installs the setup skill (how to install and start Lupe) and `install-skill`
+installs the workflow skill (checkpoints, branches, privacy) into each agent's
+skill directory. The agent loads them automatically on its next session.
+
+Lupe **never** creates, edits, or paraphrases instructions into `AGENTS.md`,
+`CLAUDE.md`, or any project file. Setup is skills + the `lupe` commands only —
+nothing is written into your repo's agent-instruction files. If an agent tries
+to copy the workflow into `AGENTS.md`, it is misbehaving: re-run
+`lupe install-skill` so it loads the skill instead.
 
 ## Privacy
 
