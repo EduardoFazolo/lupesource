@@ -8,7 +8,7 @@ Depends on: `01-branches-schema.md`, `02-workspace-branch-routing.md`
 ## Files
 - `lupe-core/src/lib.rs` — remove fork fns, add branch fns
 - `lupe-cli/src/main.rs` — rename commands, update restore
-- `lupe-core/src/lib.rs` — `DOCS` constant, `lupe_agent_section()`
+- `lupe-core/src/lib.rs` — `DOCS` constant
 
 ## Tasks
 
@@ -37,8 +37,6 @@ Depends on: `01-branches-schema.md`, `02-workspace-branch-routing.md`
 ### Docs
 
 - [ ] `DOCS` constant in `lib.rs`: replace all `fork`/`forks`/`dead` language with `branch`/`branches`.
-
-- [ ] `lupe_agent_section()` in `lib.rs`: same purge. Remove "dead branch" references. Update workflow instructions to use `lupe branch <name>`.
 
 ## Done when
 `lupe branch my-feature` creates a branch. `lupe branches` lists them. `lupe restore my-feature` restores to that branch's head. Old `lupe fork` / `lupe forks` commands are gone.

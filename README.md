@@ -44,8 +44,10 @@ a `.lupe-branch` file — no env vars, no config.
 
 ```bash
 lupe branch "fix-login-bug"             # create branch at current HEAD
+lupe use fix-login-bug                  # route this directory to the branch
 lupe branches                           # list all branches
 lupe restore fix-login-bug              # restore to a branch's head
+lupe use main                           # route back to main
 ```
 
 ### workspace
@@ -88,7 +90,7 @@ lupe history --all            # list all branches
 lupe prompts                  # list checkpoints with prompts
 lupe graph                    # terminal graph of main branch
 lupe graph --all              # terminal graph of all branches
-lupe graph --web              # interactive graph in browser
+lupe graph --web --port 4747  # interactive graph in browser
 lupe search "query"           # full-text search across history
 lupe files <checkpoint-id>    # list files in a checkpoint
 lupe cat <file> <checkpoint>  # print a file as it existed in a checkpoint
@@ -97,31 +99,39 @@ lupe cat <file> <checkpoint>  # print a file as it existed in a checkpoint
 ## Setup
 
 ```bash
-lupe install                  # configure workspace + agent stop hooks
-lupe install --workspace PATH # configure another workspace
+lupe install                  # configure agent stop hooks
 lupe install-hooks            # only wire stop hooks (Claude Code, Codex, Cursor)
-lupe install-agent            # only write AGENTS.md workflow instructions
+lupe agent-install            # install Lupe setup skill into Codex, Claude, and Cursor
+lupe install-skill            # install Lupe usage skill into Codex, Claude, and Cursor
+lupe agent-install --agent codex
+lupe agent-install --agent claude
+lupe agent-install --agent cursor
+lupe install-skill --agent codex
+lupe install-skill --agent claude
+lupe install-skill --agent cursor
 ```
 
 `lupe install` records the current `lupe` binary path in hook commands with
 `LUPE_BIN=...`, so hooks do not depend on a hardcoded user-specific path.
+
+Lupe does not create or update `AGENTS.md`. Use `lupe agent-install` for
+agent-facing setup guidance and `lupe install-skill` for workflow instructions.
+
+## Privacy
+
+```bash
+lupe private                    # flag the next checkpoint as private
+lupe prompt --private "prompt"  # create a private prompt checkpoint directly
+```
+
+Private checkpoints are hidden from `history`, `graph`, and `prompts` by
+default. Add `--show-private` to reveal them.
 
 ## Real-time Graph
 
 `lupe graph --web` opens a browser UI that updates in real time as agents
 write checkpoints on any branch. Useful for watching parallel agent
 orchestration live.
-
-## Agent Instructions
-
-Agents should follow [AGENTS.md](AGENTS.md). Keep it updated whenever Lupe's
-CLI, storage, terminology, or workflow changes.
-
-To add Lupe instructions to another workspace:
-
-```bash
-lupe install --workspace /path/to/workspace
-```
 
 ## Merge Workflow (agent-driven)
 

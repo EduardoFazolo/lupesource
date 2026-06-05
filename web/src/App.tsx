@@ -88,7 +88,7 @@ export default function App() {
     es.onerror = () => fetchGraph();
 
     // Heartbeat poll — catches anything SSE misses (reconnects, missed events)
-    const interval = setInterval(fetchGraph, 5000);
+    const interval = setInterval(fetchGraph, 1000);
 
     return () => { es.close(); clearInterval(interval); };
   }, []);

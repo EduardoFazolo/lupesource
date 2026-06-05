@@ -167,40 +167,42 @@ Every agent session follows this pattern:
   lupe prompt "<user prompt>"      — auto-called by stop hook. Records what was asked.
   lupe save "<message>"            — snapshot workspace as a new checkpoint.
   lupe branch <name>               — create a named branch at current HEAD.
+  lupe use <name>                  — route checkpoints from this directory to that branch.
   lupe restore <checkpoint|branch> — roll back to any checkpoint. Never edit files manually to undo.
 
 TRACKING
 --------
-  lupe prompt <text>            Record a user prompt + snapshot. --private to hide from history.
-  lupe checkpoint <title>       Create a named checkpoint manually.
-  lupe save [message]           Snapshot current workspace as a new checkpoint.
-  lupe respond <text>           Attach agent response to latest checkpoint (called by hook).
-  lupe title <title>            Update the title of the latest checkpoint.
-  lupe private                  Flag the NEXT checkpoint as private.
+  lupe prompt <text>               Record a user prompt + snapshot. --private hides it by default.
+  lupe checkpoint <title> --prompt Create a named checkpoint manually.
+  lupe save [message]              Snapshot current workspace as a new checkpoint.
+  lupe respond <text>              Attach agent response to the latest checkpoint.
+  lupe title <title>               Update the title of the latest checkpoint.
+  lupe private                     Flag the NEXT checkpoint as private.
 
 HISTORY & INSPECTION
 --------------------
-  lupe history [--all]          List checkpoints. --all includes all branches.
-  lupe graph [--all]            Visual tree of checkpoints.
-  lupe prompts [--all]          List checkpoints showing only the user prompt.
-  lupe diff [from] [to]         File changes between two checkpoints.
-  lupe search <query>           Full-text search across prompts, titles, responses.
-  lupe files <checkpoint-id>    List all files tracked in a checkpoint.
-  lupe cat <file> <checkpoint>  Print file contents as they existed in a checkpoint.
+  lupe status / lupe init          Show store status and create .lupeignore if missing.
+  lupe history [--all]             List checkpoints. --all includes all branches.
+  lupe graph [--all]               Visual tree of checkpoints.
+  lupe graph --web [--port N]      Open the live web graph.
+  lupe prompts [--all]             List checkpoints showing prompts and responses.
+  lupe diff [from] [to]            File changes between two checkpoints.
+  lupe search <query>              Full-text search across prompts, titles, responses.
+  lupe files <checkpoint-id>       List all files tracked in a checkpoint.
+  lupe cat <file> <checkpoint>     Print file contents as it existed in a checkpoint.
 
   Add --show-private to history, graph, or prompts to reveal private checkpoints.
 
 BRANCHES & WORKSPACES
 ---------------------
-  lupe branch <name>            Create a named branch at current HEAD.
-  lupe branches                 List all branches.
-  lupe use <branch>             Set active branch for this directory. Writes .lupe-branch
-                                so ALL subsequent checkpoints (including auto-hook ones)
-                                go to that branch. Use 'main' to switch back.
-  lupe restore <branch-name>    Restore workspace to a branch's head checkpoint.
-  lupe workspace new <branch>   Create an isolated directory for parallel agent work.
-  lupe workspace list           List active workspaces.
-  lupe workspace drop <name>    Remove a workspace.
+  lupe branch <name>               Create a named branch at current HEAD.
+  lupe branches                    List all branches.
+  lupe use <branch>                Set active branch for this directory. Writes .lupe-branch.
+  lupe use main                    Remove .lupe-branch and route checkpoints to main.
+  lupe restore <branch-name>       Restore workspace to a branch's head checkpoint.
+  lupe workspace new <branch>      Create an isolated directory for parallel agent work.
+  lupe workspace list              List active workspaces.
+  lupe workspace drop <name>       Remove a workspace.
 
   AGENT WORKFLOW — when asked to work on a branch:
     1. lupe branch <name>          — create the branch
@@ -229,9 +231,27 @@ BRANCHES & WORKSPACES
 
 SETUP
 -----
-  lupe status / lupe init       Show current state. Init lupe in a new project.
-  lupe install                  Install hooks + agent instructions into a workspace.
-  lupe author --name --email    Set author identity.
+  lupe install                     Install stop hooks for Claude Code, Codex, and Cursor.
+  lupe install-hooks               Same as install. Accepts --lupe-bin.
+  lupe install-skill               Install the bundled Lupe usage skill into agents.
+  lupe agent-install               Install the bundled Lupe setup skill into agents.
+  lupe install-skill --agent codex Install only into ~/.codex/skills.
+  lupe install-skill --agent claude Install only into ~/.claude/skills.
+  lupe install-skill --agent cursor Install only into ~/.cursor/skills.
+  lupe agent-install --agent codex Install setup skill only into ~/.codex/skills.
+  lupe agent-install --agent claude Install setup skill only into ~/.claude/skills.
+  lupe agent-install --agent cursor Install setup skill only into ~/.cursor/skills.
+  lupe author                      Show checkpoint author identity.
+  lupe author --name --email       Set checkpoint author identity.
+
+PROJECT FILES
+-------------
+  .lupeignore                      Paths Lupe does not snapshot. Created by prompt/init/status.
+  .lupe-branch                     Current directory branch route. Created by lupe use/workspace.
+  .lupeshared                      Paths symlinked into new Lupe workspaces instead of copied.
+
+Lupe does not create or update AGENTS.md. Use `lupe install-skill` for
+agent-facing workflow instructions and `lupe agent-install` for setup guidance.
 
 MERGE WORKFLOW (manual, agent-driven)
 --------------------------------------
@@ -1639,127 +1659,43 @@ pub fn install_hooks(lupe_bin: &FsPath) -> Result<()> {
     Ok(())
 }
 
-pub fn install_agent_instructions(workspace: &FsPath) -> Result<PathBuf> {
-    let path = workspace.join("AGENTS.md");
-    let section = lupe_agent_section();
-
-    if path.exists() {
-        let current = fs::read_to_string(&path)?;
-        if current.contains("<!-- lupe-agent-workflow -->") {
-            return Ok(path);
-        }
-        let updated = format!("{current}\n\n{section}");
-        fs::write(&path, updated)?;
-    } else {
-        fs::write(&path, section)?;
-    }
-
-    Ok(path)
+pub fn install_lupe_skill(agent: &str) -> Result<Vec<PathBuf>> {
+    install_bundled_skill(agent, "lupe-agent")
 }
 
-pub fn lupe_agent_section() -> &'static str {
-    r#"<!-- lupe-agent-workflow -->
-# Lupe Agent Workflow
+pub fn install_agent_install_skill(agent: &str) -> Result<Vec<PathBuf>> {
+    install_bundled_skill(agent, "lupe-agent-install")
+}
 
-Lupe is prompt-driven source control for agents.
+fn install_bundled_skill(agent: &str, skill_name: &str) -> Result<Vec<PathBuf>> {
+    let home_dir = std::env::var("HOME").context("HOME not set")?;
+    let skill_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../skills")
+        .join(skill_name)
+        .join("SKILL.md")
+        .canonicalize()
+        .with_context(|| format!("failed to locate bundled {skill_name} skill"))?;
+    let targets = match agent {
+        "all" => vec![
+            PathBuf::from(&home_dir).join(".codex").join("skills").join(skill_name),
+            PathBuf::from(&home_dir).join(".claude").join("skills").join(skill_name),
+            PathBuf::from(&home_dir).join(".cursor").join("skills").join(skill_name),
+        ],
+        "codex" => vec![PathBuf::from(&home_dir).join(".codex").join("skills").join(skill_name)],
+        "claude" => vec![PathBuf::from(&home_dir).join(".claude").join("skills").join(skill_name)],
+        "cursor" => vec![PathBuf::from(&home_dir).join(".cursor").join("skills").join(skill_name)],
+        other => bail!("unknown agent '{other}' (expected all, codex, claude, or cursor)"),
+    };
 
-## Privacy — MANDATORY
-
-**Before starting ANY task, check `.lupeprivate` if it exists, then check the
-user's prompt against it. If any keyword matches, or any file being touched
-matches a path pattern — run `lupe private` immediately. No exceptions.**
-
-Built-in triggers — ALWAYS mark private without needing `.lupeprivate`:
-- Prompt contains: secret, password, token, api key, credential, vulnerability,
-  exploit, CVE, auth, private key, certificate, .env
-- Task touches: .env, .env.*, secrets/, *secret*, *credential*, *private_key*
-- User says: "don't log this", "keep this private", "sensitive", "confidential"
-
-```bash
-lupe private                  # mark current checkpoint private
-lupe prompt --private "..."   # create private checkpoint from the start
-```
-
-## Project Setup — Do This First
-
-At the start of any session in a new project, check for `.lupeignore`. If missing,
-detect the stack and create it.
-
-Detect stack: `package.json` → Node, `Cargo.toml` → Rust, `requirements.txt`/
-`pyproject.toml` → Python, `go.mod` → Go, `pom.xml`/`build.gradle` → Java.
-
-`.lupeignore` — what lupe does NOT snapshot. Auto-created on first `lupe prompt`
-with generic defaults, but create it early with stack-specific entries
-(e.g. `dist`, `.next`, `__pycache__`, `build`).
-
-## Branches — MANDATORY
-
-**Before modifying any file, you MUST create a branch and activate it. No exceptions.**
-
-```bash
-lupe branch "fix-login-bug"       # 1. create branch
-lupe use fix-login-bug            # 2. REQUIRED: route your checkpoints to it
-# ... do work ...
-lupe use main                     # 3. switch back when done
-```
-
-`lupe use <branch>` writes `.lupe-branch` to the current directory so the
-auto-capture hook routes ALL checkpoints (including ones triggered by the
-stop hook) to the right branch instead of main. Without this step your
-work appears on main in the graph.
-
-Do NOT skip `lupe use` even for "small" changes.
-
-Trying an alternative approach:
-1. `lupe branch "<task-name>"` — create branch
-2. `lupe use "<task-name>"` — activate it (REQUIRED)
-3. Make the change
-4. `lupe save "what changed"`
-5. If it works: keep going. If not: `lupe restore <branch-name>` to roll back.
-6. `lupe use main` — deactivate when done
-
-## Workflow
-
-At the start of every user request that may modify files, run:
-
-```bash
-lupe prompt "<full user prompt>"
-```
-
-During work, run:
-
-```bash
-lupe save "<short description of what changed or now works>"
-```
-
-Save after each coherent functional unit, before risky changes, after tests pass,
-and before restore/destructive operations.
-
-**Never revert work by editing files manually. Always use `lupe restore`.**
-
-Useful commands:
-
-```bash
-lupe history
-lupe prompts
-lupe branches
-lupe graph
-lupe search "<topic>"
-lupe diff
-lupe diff <checkpoint-uuid>
-lupe diff <from-uuid> <to-uuid>
-lupe restore <checkpoint-uuid-or-branch-name>
-lupe branch "name"
-lupe use "name"          # activate branch (routes hook checkpoints to it)
-lupe use main            # deactivate (back to main)
-lupe author
-lupe author --name "Name" --email "email"
-```
-
-Lupe does not automatically see prompts unless the agent or host calls Lupe.
-This file is the contract that tells agents when to call it.
-<!-- /lupe-agent-workflow -->
-"#
+    let mut installed = Vec::new();
+    for dir in targets {
+        fs::create_dir_all(&dir)?;
+        let dest = dir.join("SKILL.md");
+        fs::copy(&skill_src, &dest)
+            .with_context(|| format!("failed to install skill to {}", dest.display()))?;
+        installed.push(dest);
+    }
+    Ok(installed)
 }
 
 pub fn title_from_response(response: &str) -> Option<String> {

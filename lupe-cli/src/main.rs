@@ -1,9 +1,9 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use lupe_core::{
     Colors, Store,
     absolutize, detect_agent,
-    friendly_time, git_push, install_agent_instructions, install_hooks,
+    friendly_time, git_push, install_agent_install_skill, install_hooks, install_lupe_skill,
     one_line, print_diff_lines, resolve_lupe_bin, short_id,
     title_from_prompt, write_default_lupeignore, DOCS,
 };
@@ -103,21 +103,20 @@ enum Command {
     Respond {
         response: String,
     },
-    #[command(about = "Install lupe hooks and agent instructions into a workspace.")]
+    #[command(about = "Install lupe stop hooks into supported agents.")]
     Install {
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
         #[arg(long)]
         lupe_bin: Option<PathBuf>,
-        #[arg(long)]
-        no_agent: bool,
-        #[arg(long)]
-        no_hooks: bool,
     },
-    #[command(about = "Install agent instructions (AGENTS.md) into a workspace.")]
-    InstallAgent {
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
+    #[command(about = "Install the Lupe usage skill into local agent skill directories.")]
+    InstallSkill {
+        #[arg(long, default_value = "all", value_parser = ["all", "codex", "claude", "cursor"])]
+        agent: String,
+    },
+    #[command(about = "Install the Lupe setup skill that teaches agents how to install and start using Lupe.")]
+    AgentInstall {
+        #[arg(long, default_value = "all", value_parser = ["all", "codex", "claude", "cursor"])]
+        agent: String,
     },
     #[command(about = "Push workspace changes to git remote with a lupe checkpoint message.")]
     Push {
@@ -126,7 +125,7 @@ enum Command {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
-    #[command(about = "Install the lupe stop hook into the global Claude Code hooks config.")]
+    #[command(about = "Install the lupe stop hook into global Claude Code, Codex, and Cursor hook configs.")]
     InstallHooks {
         #[arg(long)]
         lupe_bin: Option<PathBuf>,
@@ -155,7 +154,7 @@ enum Command {
         file: String,
         checkpoint: String,
     },
-    #[command(about = "List all files tracked in a checkpoint. Useful before a merge to see what each fork contains.")]
+    #[command(about = "List all files tracked in a checkpoint. Useful before a merge to see what each branch contains.")]
     Files {
         checkpoint: String,
     },
@@ -554,24 +553,9 @@ async fn main() -> Result<()> {
             };
             git_push(&workspace, &msg)?;
         }
-        Command::Install {
-            workspace,
-            lupe_bin,
-            no_agent,
-            no_hooks,
-        } => {
-            if no_agent && no_hooks {
-                bail!("nothing to install: remove either --no-agent or --no-hooks");
-            }
-            let workspace = absolutize(workspace)?;
-            if !no_agent {
-                let path = install_agent_instructions(&workspace)?;
-                println!("agent       -> {}", path.display());
-            }
-            if !no_hooks {
-                let lupe_bin = resolve_lupe_bin(lupe_bin)?;
-                install_hooks(&lupe_bin)?;
-            }
+        Command::Install { lupe_bin } => {
+            let lupe_bin = resolve_lupe_bin(lupe_bin)?;
+            install_hooks(&lupe_bin)?;
             println!("done. restart your agents to pick up new hooks.");
         }
         Command::InstallHooks { lupe_bin } => {
@@ -579,15 +563,23 @@ async fn main() -> Result<()> {
             install_hooks(&lupe_bin)?;
             println!("done. restart your agents to pick up new hooks.");
         }
-        Command::InstallAgent { workspace } => {
-            let workspace = absolutize(workspace)?;
-            let path = install_agent_instructions(&workspace)?;
-            println!("installed agent instructions {}", path.display());
+        Command::InstallSkill { agent } => {
+            let installs = install_lupe_skill(&agent)?;
+            for path in installs {
+                println!("skill        -> {}", path.display());
+            }
+            println!("done. restart your agents to pick up the skill.");
+        }
+        Command::AgentInstall { agent } => {
+            let installs = install_agent_install_skill(&agent)?;
+            for path in installs {
+                println!("skill        -> {}", path.display());
+            }
+            println!("done. restart your agents to pick up the setup skill.");
         }
         Command::Status | Command::Init => {
             let workspace = absolutize(PathBuf::from("."))?;
             write_default_lupeignore(&workspace)?;
-            install_agent_instructions(&workspace)?;
             println!("lupe ok");
             println!("mode {}", store.home_source);
             println!("home {}", store.home.display());
