@@ -83,6 +83,8 @@ enum Command {
         web: bool,
         #[arg(long, default_value = "4747", help = "Port for --web server")]
         port: u16,
+        #[arg(long, help = "Group checkpoints by session (one block per conversation)")]
+        sessions: bool,
     },
     #[command(about = "Show file changes between two checkpoints. Defaults to last two checkpoints if omitted.")]
     Diff {
@@ -102,6 +104,10 @@ enum Command {
     #[command(about = "Attach an agent response to the latest checkpoint. Called by the stop hook automatically.")]
     Respond {
         response: String,
+    },
+    #[command(about = "Update the agent field on the latest checkpoint. Called by the stop hook to backfill model info.")]
+    SetAgent {
+        agent: String,
     },
     #[command(about = "Install lupe stop hooks into supported agents.")]
     Install {
@@ -241,6 +247,7 @@ async fn main() -> Result<()> {
             write_default_lupeignore(&workspace)?;
             let title = title.unwrap_or_else(|| title_from_prompt(&prompt));
             let agent = detect_agent(agent);
+            let session = session.or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok());
             let checkpoint = store
                 .create_checkpoint(title, Some(prompt), Some(agent), session, &workspace, private)
                 .await?;
@@ -276,8 +283,10 @@ async fn main() -> Result<()> {
         Command::Save { message, workspace } => {
             let workspace = absolutize(workspace)?;
             let title = message.unwrap_or_else(|| "save".to_string());
+            let agent = detect_agent(None);
+            let session = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
             let checkpoint = store
-                .create_checkpoint(title.clone(), None, None, None, &workspace, false)
+                .create_checkpoint(title.clone(), None, Some(agent), session, &workspace, false)
                 .await?;
             println!(
                 "checkpoint {} ({}) files={} root={} {}",
@@ -325,9 +334,84 @@ async fn main() -> Result<()> {
                 println!();
             }
         }
-        Command::Graph { no_color, all, show_private, web, port } => {
+        Command::Graph { no_color, all, show_private, web, port, sessions } => {
             if web {
                 serve_web_graph(&store, port).await?;
+                return Ok(());
+            }
+            if sessions {
+                let colors = Colors::new(!no_color);
+                let all_checkpoints = store.list_checkpoints(true, show_private).await?;
+                if all_checkpoints.is_empty() {
+                    println!("no checkpoints yet");
+                    return Ok(());
+                }
+
+                // Group by session_id; null session_id goes to "(untracked)" bucket.
+                let mut sessions_map: std::collections::HashMap<String, Vec<lupe_core::CheckpointView>> =
+                    std::collections::HashMap::new();
+                for cp in &all_checkpoints {
+                    let key = cp.session_id.clone().unwrap_or_else(|| "(untracked)".to_string());
+                    sessions_map.entry(key).or_default().push(cp.clone());
+                }
+
+                // Sort each group oldest-first (they come from DB in insertion order already, but be explicit).
+                for group in sessions_map.values_mut() {
+                    group.sort_by_key(|c| c.created_at);
+                }
+
+                // Sort groups newest-first by their latest checkpoint.
+                let mut groups: Vec<(String, Vec<lupe_core::CheckpointView>)> = sessions_map.into_iter().collect();
+                groups.sort_by(|a, b| {
+                    let ta = a.1.last().map(|c| c.created_at).unwrap_or_default();
+                    let tb = b.1.last().map(|c| c.created_at).unwrap_or_default();
+                    tb.cmp(&ta)
+                });
+
+                let head_checkpoint = store.read_head();
+                for (session_key, cps) in &groups {
+                    let first = cps.first().unwrap();
+                    let last  = cps.last().unwrap();
+                    let agent_label = first.agent.as_deref().unwrap_or("unknown");
+                    let short_key = if session_key == "(untracked)" {
+                        session_key.clone()
+                    } else {
+                        session_key.chars().take(8).collect()
+                    };
+                    println!(
+                        "{}  {}  {}  {}",
+                        colors.checkpoint(&format!("◈ session {short_key}")),
+                        colors.dim(&format!("{} checkpoint{}", cps.len(), if cps.len() == 1 { "" } else { "s" })),
+                        colors.dim(&friendly_time(last.created_at)),
+                        colors.dim(agent_label),
+                    );
+                    for (i, cp) in cps.iter().rev().enumerate() {
+                        let is_last = i + 1 == cps.len();
+                        let connector = if is_last { "╰─" } else { "├─" };
+                        let is_head = head_checkpoint == Some(cp.id);
+                        let head_marker = if is_head { " [HEAD]" } else { "" };
+                        let title_str = if cp.private && !show_private {
+                            colors.private_cp("[private]")
+                        } else {
+                            colors.bold(&cp.title)
+                        };
+                        let branch_tag = if cp.branch_name != "main" {
+                            format!("  {}", colors.branch(&cp.branch_name))
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "{}  {}  {} {}{}{}",
+                            colors.dim(&format!("│  {connector}")),
+                            colors.dim(&short_id(cp.id)),
+                            title_str,
+                            colors.dim(&friendly_time(cp.created_at)),
+                            branch_tag,
+                            head_marker,
+                        );
+                    }
+                    println!();
+                }
                 return Ok(());
             }
             let colors = Colors::new(!no_color);
@@ -536,6 +620,10 @@ async fn main() -> Result<()> {
         Command::Respond { response } => {
             let checkpoint_id = store.set_response(response).await?;
             println!("response saved to checkpoint {}", short_id(checkpoint_id));
+        }
+        Command::SetAgent { agent } => {
+            let checkpoint_id = store.set_agent(agent).await?;
+            println!("agent updated on checkpoint {}", short_id(checkpoint_id));
         }
         Command::Push { message, workspace } => {
             let workspace = absolutize(workspace)?;

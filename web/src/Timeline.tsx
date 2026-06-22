@@ -18,15 +18,25 @@ const C = {
   textMuted: '#b0aac8',
 };
 
-function branchHue(name: string): number {
-  if (name === 'main') return 255;
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = Math.imul(h * 31 + name.charCodeAt(i), 1) | 0;
+function strHue(s: string, seed = 0): number {
+  let h = seed;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h * 31 + s.charCodeAt(i), 1) | 0;
   const raw = Math.abs(h) % 300;
   return raw < 40 ? raw + 300 : raw;
 }
+function branchHue(name: string): number {
+  return name === 'main' ? 255 : strHue(name, 0);
+}
 function branchColor(name: string)    { return `hsl(${branchHue(name)}, 52%, 58%)`; }
 function branchColorDim(name: string) { return `hsl(${branchHue(name)}, 40%, 72%)`; }
+
+function sessionColor(sessionId: string | null, agent: string | null): string {
+  // Prefer session_id — each conversation gets its own color.
+  // Fall back to full agent string (includes model) so at least model differences show.
+  const key = sessionId?.trim() || (agent ?? 'unknown').trim() || 'unknown';
+  const hue = strHue(key, 17);
+  return `hsl(${hue}, 62%, 54%)`;
+}
 
 function timeAgo(iso: string) {
   const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -84,10 +94,10 @@ function buildRows(checkpoints: CheckpointData[]): Row[] {
   for (let mi = 0; mi < main.length; mi++) {
     const mainCp = main[mi];
     const branchEntries = (byParent.get(mainCp.id) ?? []).filter(c => c.branch_name !== 'main');
-    const hasBelow = mi < main.length - 1 || branchEntries.length > 0;
-    // branchArmColor: if this row is the parent of a branch, show the arm coming from its dot.
+    // Display is reversed (rows.reverse() below): top = newest, bottom = oldest.
+    // So in VISUAL terms: a newer main sits above (hasAbove), an older main sits below (hasBelow).
     const branchArmColor = branchEntries.length > 0 ? branchColor(branchEntries[0].branch_name) : null;
-    rows.push({ kind: 'main', cp: mainCp, hasAbove: mi > 0, hasBelow, branchArmColor });
+    rows.push({ kind: 'main', cp: mainCp, hasAbove: mi < main.length - 1, hasBelow: mi > 0, branchArmColor });
 
     for (const entry of branchEntries) {
       const nodes = chain(entry); // oldest → newest
@@ -214,13 +224,13 @@ function Card({ cp, selected, onSelect, headRef, color, gutter }: CardProps) {
         )}
       </div>
 
-      {/* Branch color corner */}
+      {/* Session color corner */}
       <div style={{
         position: 'absolute', bottom: 0, right: 0,
         width: 0, height: 0,
         borderLeft: '14px solid transparent',
-        borderBottom: `14px solid ${color}`,
-        opacity: 0.35, pointerEvents: 'none',
+        borderBottom: `14px solid ${sessionColor(cp.session_id, cp.agent)}`,
+        opacity: 0.45, pointerEvents: 'none',
       }} />
     </div>
   );

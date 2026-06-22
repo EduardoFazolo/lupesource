@@ -134,7 +134,7 @@ export default function App() {
           selectedId={selectedId}
           onSelect={setSelectedId}
         />
-        <Detail checkpoint={selected} />
+        <Detail checkpoint={selected} checkpoints={data.checkpoints} />
       </div>
     </div>
   );

@@ -186,6 +186,10 @@ def main() -> None:
     # Attach agent response to that checkpoint
     run_lupe("respond", assistant_text.strip())
 
+    # Backfill the model onto the latest checkpoint — fixes checkpoints created by
+    # `lupe save` which only know the agent name, not the model.
+    run_lupe("set-agent", agent)
+
     # If private flag wasn't set at prompt creation, mark now in case response triggered it
     if private:
         run_lupe("private")

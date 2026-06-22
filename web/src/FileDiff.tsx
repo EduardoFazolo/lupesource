@@ -17,6 +17,7 @@ export interface FileDiff {
   path: string;
   status: 'added' | 'modified' | 'removed';
   is_binary: boolean;
+  too_large: boolean;
   hunks: DiffHunk[];
 }
 
@@ -181,9 +182,13 @@ export function FileDiffView({ file, defaultExpanded = false }: {
             <div style={{ padding: '12px 14px', color: '#8c959f', fontSize: 12, background: '#fff' }}>
               Binary file not shown
             </div>
+          ) : file.too_large ? (
+            <div style={{ padding: '12px 14px', color: '#8c959f', fontSize: 12, background: '#fff' }}>
+              File too large to display — changed, diff not shown
+            </div>
           ) : file.hunks.length === 0 ? (
             <div style={{ padding: '12px 14px', color: '#8c959f', fontSize: 12, background: '#fff' }}>
-              {file.status === 'added' ? 'Empty file added' : file.status === 'removed' ? 'File removed' : 'No changes'}
+              {file.status === 'added' ? 'Empty file added' : file.status === 'removed' ? 'File removed' : 'No textual changes'}
             </div>
           ) : (
             <div style={{ background: '#fff', overflowX: 'auto' }}>

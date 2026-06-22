@@ -99,6 +99,7 @@ pub struct WebFileDiff {
     pub path: String,
     pub status: String, // "added" | "modified" | "removed"
     pub is_binary: bool,
+    pub too_large: bool,
     pub hunks: Vec<WebHunk>,
 }
 
@@ -523,7 +524,18 @@ impl Store {
         Ok(checkpoint_id)
     }
 
+    pub async fn set_agent(&self, agent: String) -> Result<Uuid> {
+        let checkpoint_id = self.latest_checkpoint_id().await?;
+        sqlx::query("update checkpoints set agent = ?1 where id = ?2")
+            .bind(&agent)
+            .bind(checkpoint_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(checkpoint_id)
+    }
+
     pub async fn set_response(&self, response: String) -> Result<Uuid> {
+        let response = scrub_secrets(&response);
         let checkpoint_id = self.latest_checkpoint_id().await?;
         self.set_response_for(checkpoint_id, response.clone()).await?;
         if let Some(title) = title_from_response(&response) {
@@ -537,6 +549,7 @@ impl Store {
     }
 
     pub async fn set_response_for(&self, checkpoint_id: Uuid, response: String) -> Result<()> {
+        let response = scrub_secrets(&response);
         sqlx::query("update checkpoints set response = ?1 where id = ?2")
             .bind(&response)
             .bind(checkpoint_id.to_string())
@@ -985,15 +998,24 @@ pub fn detect_agent(override_val: Option<String>) -> String {
     if let Ok(v) = std::env::var("LUPE_AGENT") {
         return v;
     }
-    let name = if std::env::var("CLAUDE_CODE_VERSION").is_ok() {
+    let has = |k: &str| std::env::var(k).is_ok();
+    let name = if has("CLAUDECODE") || has("CLAUDE_CODE_ENTRYPOINT") || has("CLAUDE_CODE_VERSION") {
         "claude-code"
-    } else if std::env::var("CURSOR_EDITOR").is_ok() {
+    } else if has("CURSOR_TRACE_ID") || has("CURSOR_EDITOR") {
         "cursor"
+    } else if has("CODEX_SANDBOX") || has("CODEX_HOME") {
+        "codex"
     } else {
         "unknown"
     };
-    let model = std::env::var("LUPE_AGENT_MODEL").unwrap_or_else(|_| "unknown".to_string());
-    format!("{name}/{model}")
+    // Model is rarely in the subprocess env; the stop hook supplies it via --agent.
+    let model = std::env::var("LUPE_AGENT_MODEL")
+        .ok()
+        .or_else(|| std::env::var("ANTHROPIC_MODEL").ok());
+    match model {
+        Some(m) if !m.is_empty() => format!("{name}/{m}"),
+        _ => name.to_string(),
+    }
 }
 
 pub async fn diff_file_counts(
@@ -1084,7 +1106,7 @@ pub async fn compute_web_diff(
             let p = object_path(object_dir, hash)?;
             let meta = fs::metadata(&p).unwrap_or_else(|_| fs::metadata(".").unwrap());
             if meta.len() > MAX_FILE_BYTES {
-                result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: false, hunks: vec![] });
+                result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: false, too_large: true, hunks: vec![] });
                 continue;
             }
             fs::read(&p).unwrap_or_default()
@@ -1096,7 +1118,7 @@ pub async fn compute_web_diff(
             let p = object_path(object_dir, hash)?;
             let meta = fs::metadata(&p).unwrap_or_else(|_| fs::metadata(".").unwrap());
             if meta.len() > MAX_FILE_BYTES {
-                result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: false, hunks: vec![] });
+                result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: false, too_large: true, hunks: vec![] });
                 continue;
             }
             fs::read(&p).unwrap_or_default()
@@ -1106,7 +1128,7 @@ pub async fn compute_web_diff(
 
         let is_binary = old_bytes.iter().any(|&b| b == 0) || new_bytes.iter().any(|&b| b == 0);
         if is_binary {
-            result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: true, hunks: vec![] });
+            result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary: true, too_large: false, hunks: vec![] });
             continue;
         }
 
@@ -1145,7 +1167,7 @@ pub async fn compute_web_diff(
             }
         }
 
-        result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary, hunks });
+        result.push(WebFileDiff { path: path.clone(), status: status.to_string(), is_binary, too_large: false, hunks });
     }
 
     Ok(result)
@@ -1748,6 +1770,69 @@ fn title_contains_sensitive(title: &str) -> bool {
     SENSITIVE_KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
+// Variable name fragments that signal a secret value — matched case-insensitively.
+const SECRET_VAR_FRAGMENTS: &[&str] = &[
+    "secret", "password", "passwd", "token", "apikey", "api_key",
+    "private_key", "privatekey", "auth_key", "authkey", "credential",
+];
+
+/// Redact values of environment-variable-style assignments whose name looks like a secret.
+/// e.g. `TRIGGER_SECRET_KEY=abc123` → `TRIGGER_SECRET_KEY=[REDACTED]`
+/// Handles multiple assignments on one line (shell env-var prefix style).
+pub fn scrub_secrets(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+
+    for line in text.split('\n') {
+        let mut pos = 0;
+
+        while pos < line.len() {
+            // Copy any leading whitespace verbatim
+            let ws_end = line[pos..]
+                .find(|c: char| !c.is_whitespace())
+                .map(|i| pos + i)
+                .unwrap_or(line.len());
+            result.push_str(&line[pos..ws_end]);
+            pos = ws_end;
+            if pos >= line.len() {
+                break;
+            }
+
+            // Collect next whitespace-delimited token
+            let tok_end = line[pos..]
+                .find(|c: char| c.is_whitespace())
+                .map(|i| pos + i)
+                .unwrap_or(line.len());
+            let token = &line[pos..tok_end];
+
+            // If token looks like VAR=value and VAR is secret-sounding, redact value
+            if let Some(eq_pos) = token.find('=') {
+                let var_lower = token[..eq_pos].to_lowercase();
+                let value = &token[eq_pos + 1..];
+                if !value.is_empty()
+                    && SECRET_VAR_FRAGMENTS.iter().any(|s| var_lower.contains(s))
+                {
+                    result.push_str(&token[..eq_pos + 1]);
+                    result.push_str("[REDACTED]");
+                    pos = tok_end;
+                    continue;
+                }
+            }
+
+            result.push_str(token);
+            pos = tok_end;
+        }
+
+        result.push('\n');
+    }
+
+    // Preserve original trailing-newline behaviour
+    if !text.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
 pub fn print_diff_lines(diff: &DiffView, colors: &Colors, pipe: &str, indent: &str) {
     const MAX: usize = 8;
     let mut lines: Vec<String> = Vec::new();
@@ -2219,5 +2304,25 @@ mod tests {
             cmd,
             "LUPE_BIN='/tmp/Lupe Bin/lupe' python3 '/tmp/lupe hooks/stop.py'"
         );
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_secret_vars() {
+        // Shell env-var prefix style (the exact pattern from the bug report)
+        let input = "TRIGGER_SECRET_KEY=abc123xyz SLUG=fromboise-kit bun run scripts/run.ts";
+        let out = scrub_secrets(input);
+        assert!(out.contains("TRIGGER_SECRET_KEY=[REDACTED]"), "got: {out}");
+        assert!(out.contains("SLUG=fromboise-kit"), "should keep non-secret: {out}");
+        assert!(!out.contains("abc123xyz"), "value must be gone: {out}");
+
+        // Standard TOKEN / PASSWORD
+        let input2 = "export API_TOKEN=super_secret_value\nexport DB_HOST=localhost";
+        let out2 = scrub_secrets(input2);
+        assert!(out2.contains("API_TOKEN=[REDACTED]"), "got: {out2}");
+        assert!(out2.contains("DB_HOST=localhost"), "non-secret unchanged: {out2}");
+
+        // No false positive on regular assignments
+        let input3 = "RETRY_COUNT=3 MAX_WORKERS=10";
+        assert_eq!(scrub_secrets(input3), input3);
     }
 }

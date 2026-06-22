@@ -47,7 +47,7 @@ function Collapsible({ label, defaultOpen = true, children }: {
 function Changes({ cp }: { cp: CheckpointData }) {
   const [files, setFiles] = useState<FileDiff[] | null>(null);
   const [loading, setLoading] = useState(false);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
 
   const changed = cp.diff_added + cp.diff_modified + cp.diff_removed;
 
@@ -74,7 +74,7 @@ function Changes({ cp }: { cp: CheckpointData }) {
   if (changed === 0) {
     return (
       <div style={{ fontSize: 11, color: '#b0aac8', fontStyle: 'italic' }}>
-        no file changes from previous checkpoint
+        no changes
       </div>
     );
   }
@@ -95,7 +95,7 @@ function Changes({ cp }: { cp: CheckpointData }) {
         onMouseLeave={e => { if (!open) (e.currentTarget as HTMLDivElement).style.background = open ? '#f0edfb' : '#faf9fd'; }}
       >
         <span style={{ color: '#9990c0', fontSize: 10 }}>{open ? '▾' : '▸'}</span>
-        <span style={{ color: '#4a4668', fontSize: 12, fontWeight: 600 }}>changes from previous</span>
+        <span style={{ color: '#4a4668', fontSize: 12, fontWeight: 600 }}>changes</span>
 
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, fontSize: 11 }}>
           {loading && <span style={{ color: '#c0bcd8', fontSize: 10 }}>loading…</span>}
@@ -132,7 +132,22 @@ function Changes({ cp }: { cp: CheckpointData }) {
   );
 }
 
-export function Detail({ checkpoint: cp }: { checkpoint: CheckpointData | null }) {
+// Walk up the parent chain to the nearest checkpoint that has a prompt.
+// Returns the prompt text and whether it was inherited from an ancestor.
+function originatingPrompt(cp: CheckpointData, all: CheckpointData[]): { text: string; from: CheckpointData | null } | null {
+  if (cp.prompt && cp.prompt.trim()) return { text: cp.prompt, from: null };
+  const byId = new Map(all.map(c => [c.id, c]));
+  let cur: CheckpointData | undefined = cp;
+  const seen = new Set<string>();
+  while (cur?.parent_checkpoint_id && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    cur = byId.get(cur.parent_checkpoint_id);
+    if (cur?.prompt && cur.prompt.trim()) return { text: cur.prompt, from: cur };
+  }
+  return null;
+}
+
+export function Detail({ checkpoint: cp, checkpoints = [] }: { checkpoint: CheckpointData | null; checkpoints?: CheckpointData[] }) {
   if (!cp) {
     return (
       <div style={{
@@ -155,8 +170,8 @@ export function Detail({ checkpoint: cp }: { checkpoint: CheckpointData | null }
       {/* Title */}
       <div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', color: cp.is_main_chain ? '#7c6ef0' : '#a098c0' }}>
-            {cp.is_main_chain ? '◆ CHECKPOINT' : '◆ DEAD BRANCH'}
+          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', color: cp.branch_name === 'main' ? '#7c6ef0' : '#a098c0' }}>
+            {cp.branch_name === 'main' ? '◆ CHECKPOINT' : `◆ ${(cp.branch_name || 'branch').toUpperCase()}`}
           </span>
           {cp.is_head && (
             <span style={{ fontSize: 9, fontWeight: 700, color: '#5b44e8', background: '#ede9ff', border: '1px solid #b0a8f0', borderRadius: 3, padding: '1px 6px' }}>HEAD</span>
@@ -178,14 +193,19 @@ export function Detail({ checkpoint: cp }: { checkpoint: CheckpointData | null }
         {cp.parent_checkpoint_id && <><span style={{ color: '#a09cba' }}>parent</span><span style={{ color: '#5a567a' }}>{cp.parent_checkpoint_id}</span></>}
       </div>
 
-      {/* Prompt */}
-      {cp.prompt && (
-        <Collapsible label="PROMPT">
-          <pre style={{ fontSize: 12, color: '#4a4668', background: '#fff', border: '1px solid #e8e4f4', borderRadius: 8, padding: '14px 16px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.65, fontFamily: 'inherit', maxHeight: 200, overflowY: 'auto' }}>
-            {cleanPrompt(cp.prompt)}
-          </pre>
-        </Collapsible>
-      )}
+      {/* Prompt — falls back to the originating prompt from the nearest ancestor */}
+      {(() => {
+        const origin = originatingPrompt(cp, checkpoints);
+        if (!origin) return null;
+        const label = origin.from ? `PROMPT  ·  from ${origin.from.id.slice(0, 8)}` : 'PROMPT';
+        return (
+          <Collapsible label={label}>
+            <pre style={{ fontSize: 12, color: '#4a4668', background: '#fff', border: '1px solid #e8e4f4', borderRadius: 8, padding: '14px 16px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.65, fontFamily: 'inherit', maxHeight: 200, overflowY: 'auto' }}>
+              {cleanPrompt(origin.text)}
+            </pre>
+          </Collapsible>
+        );
+      })()}
 
       {/* Response */}
       {cp.response && (
